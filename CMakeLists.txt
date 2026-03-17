@@ -8,6 +8,10 @@ project(corouv
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+file(GLOB_RECURSE BEARSSL_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/bearssl/src/*.c
+)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -35,7 +39,13 @@ target_link_libraries(async_simple INTERFACE Threads::Threads)
 # corouv library
 # -----------------------
 add_library(corouv
+  src/http.cpp
+  src/multipart.cpp
+  src/net.cpp
+  src/transport.cpp
   src/uv_executor.cpp
+  ${BEARSSL_SOURCES}
+  third_party/picohttpparser/picohttpparser.c
 )
 add_library(corouv::corouv ALIAS corouv)
 
@@ -47,6 +57,12 @@ target_include_directories(corouv PUBLIC
 target_link_libraries(corouv PUBLIC
   uv_a
   async_simple
+)
+
+target_include_directories(corouv PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/bearssl/inc
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/bearssl/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/picohttpparser
 )
 
 target_compile_features(corouv PUBLIC cxx_std_20)

@@ -31,6 +31,8 @@ corouv_add_test(corouv_test_event event_test.cpp)
 corouv_add_test(corouv_test_fs fs_test.cpp)
 corouv_add_test(corouv_test_runtime runtime_test.cpp)
 corouv_add_test(corouv_test_task_group task_group_test.cpp)
+corouv_add_test(corouv_test_net net_test.cpp)
+corouv_add_test(corouv_test_http http_test.cpp)
 
 if (UNIX)
   corouv_add_test(corouv_test_poll poll_test.cpp)

@@ -7,9 +7,11 @@
 #include <atomic>
 #include <coroutine>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include "corouv/detail/awaiter_utils.h"
@@ -81,6 +83,18 @@ public:
     Task<ScopedLock> scoped_lock() {
         co_await lock();
         co_return ScopedLock(this);
+    }
+
+    template <class F>
+    auto with_lock(F&& fn) -> Task<std::invoke_result_t<F&>> {
+        auto guard = co_await scoped_lock();
+
+        if constexpr (std::is_void_v<std::invoke_result_t<F&>>) {
+            std::invoke(std::forward<F>(fn));
+            co_return;
+        } else {
+            co_return std::invoke(std::forward<F>(fn));
+        }
     }
 
     void unlock() {

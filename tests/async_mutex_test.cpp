@@ -22,6 +22,14 @@ corouv::Task<void> increment_with_lock(corouv::AsyncMutex* mutex, int* counter,
     }
 }
 
+corouv::Task<void> increment_with_with_lock(corouv::AsyncMutex* mutex,
+                                            int* counter, int loops) {
+    for (int i = 0; i < loops; ++i) {
+        co_await mutex->with_lock([&]() { *counter += 1; });
+        co_await corouv::sleep_for(1ms);
+    }
+}
+
 corouv::Task<void> hold_lock(corouv::AsyncMutex* mutex,
                              std::chrono::milliseconds hold_time) {
     auto lock = co_await mutex->scoped_lock();
@@ -43,6 +51,20 @@ corouv::Task<void> mutex_exclusion_case() {
 
     if (counter != 32) {
         throw std::runtime_error("async_mutex_test: counter mismatch");
+    }
+
+    counter = 0;
+
+    for (int i = 0; i < 4; ++i) {
+        const bool ok = group.spawn(increment_with_with_lock(&mutex, &counter, 8));
+        if (!ok) {
+            throw std::runtime_error("async_mutex_test: with_lock spawn failed");
+        }
+    }
+    co_await group.wait();
+
+    if (counter != 32) {
+        throw std::runtime_error("async_mutex_test: with_lock counter mismatch");
     }
 }
 

@@ -33,12 +33,11 @@ corouv::Task<void> worker_loop(int worker_id, corouv::AsyncQueue<int>* queue,
         co_await sem->acquire();  // limit concurrent processing
         co_await corouv::sleep_for(40ms);
 
-        {
-            auto lock = co_await sum_mutex->scoped_lock();
+        co_await sum_mutex->with_lock([&]() {
             *sum += value;
             std::cout << "[primitives] worker " << worker_id << " value=" << value
                       << " sum=" << *sum << "\n";
-        }
+        });
 
         sem->release();
     }

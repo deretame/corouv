@@ -40,6 +40,12 @@ target_link_libraries(corouv_fs_write_read PRIVATE corouv::corouv)
 add_executable(corouv_primitives concurrency_primitives.cpp)
 target_link_libraries(corouv_primitives PRIVATE corouv::corouv)
 
+add_executable(corouv_http_server http_server.cpp)
+target_link_libraries(corouv_http_server PRIVATE corouv::corouv)
+
+add_executable(corouv_http_client http_client.cpp)
+target_link_libraries(corouv_http_client PRIVATE corouv::corouv)
+
 set(COROUV_LIBPQ_EXAMPLE_INCLUDE_DIR
   ${CMAKE_CURRENT_LIST_DIR}/../third_party/postgresql-install/include
 )

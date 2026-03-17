@@ -8,7 +8,6 @@ bin/
 # 排除特定的文件（保持目录结构）
 !.gitkeep
 
-# 针对 IDE 的过滤（可选）
 .vscode/
 .idea/
 cmake-build-*/
