@@ -1,0 +1,15 @@
+# 忽略项目根目录及任何子目录下的 build 文件夹
+build/
+bin/
+
+# 忽略所有层级下的 .cache 文件夹
+.cache/
+
+# 排除特定的文件（保持目录结构）
+!.gitkeep
+
+# 针对 IDE 的过滤（可选）
+.vscode/
+.idea/
+cmake-build-*/
+third_party/*
