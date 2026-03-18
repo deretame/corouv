@@ -25,6 +25,18 @@ target_link_libraries(corouv_blocking PRIVATE corouv::corouv)
 add_executable(corouv_timeout timeout.cpp)
 target_link_libraries(corouv_timeout PRIVATE corouv::corouv)
 
+add_executable(corouv_udp_echo udp_echo.cpp)
+target_link_libraries(corouv_udp_echo PRIVATE corouv::corouv)
+
+add_executable(corouv_udp_options udp_options.cpp)
+target_link_libraries(corouv_udp_options PRIVATE corouv::corouv)
+
+add_executable(corouv_udp_channel udp_channel.cpp)
+target_link_libraries(corouv_udp_channel PRIVATE corouv::corouv)
+
+add_executable(corouv_udp_multicast udp_multicast.cpp)
+target_link_libraries(corouv_udp_multicast PRIVATE corouv::corouv)
+
 add_executable(corouv_event event.cpp)
 target_link_libraries(corouv_event PRIVATE corouv::corouv)
 
@@ -37,6 +49,12 @@ target_link_libraries(corouv_task_group PRIVATE corouv::corouv)
 add_executable(corouv_fs_write_read fs_write_read.cpp)
 target_link_libraries(corouv_fs_write_read PRIVATE corouv::corouv)
 
+add_executable(corouv_filesystem_ops filesystem_ops.cpp)
+target_link_libraries(corouv_filesystem_ops PRIVATE corouv::corouv)
+
+add_executable(corouv_filesystem_watch filesystem_watch.cpp)
+target_link_libraries(corouv_filesystem_watch PRIVATE corouv::corouv)
+
 add_executable(corouv_primitives concurrency_primitives.cpp)
 target_link_libraries(corouv_primitives PRIVATE corouv::corouv)
 
@@ -45,6 +63,9 @@ target_link_libraries(corouv_http_server PRIVATE corouv::corouv)
 
 add_executable(corouv_http_client http_client.cpp)
 target_link_libraries(corouv_http_client PRIVATE corouv::corouv)
+
+add_executable(corouv_web_builder web_builder.cpp)
+target_link_libraries(corouv_web_builder PRIVATE corouv::corouv)
 
 set(COROUV_LIBPQ_EXAMPLE_INCLUDE_DIR
   ${CMAKE_CURRENT_LIST_DIR}/../third_party/postgresql-install/include

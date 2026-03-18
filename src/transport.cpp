@@ -510,10 +510,18 @@ CodecStream::CodecStream(net::TcpStream stream, std::unique_ptr<MemoryCodec> cod
     : _stream(std::move(stream)),
       _codec(codec ? std::move(codec) : make_passthrough_codec()) {}
 
-bool CodecStream::open() const noexcept { return _stream.open(); }
+bool CodecStream::is_open() const noexcept { return _stream.is_open(); }
 
 uv_os_sock_t CodecStream::native_handle() const noexcept {
     return _stream.native_handle();
+}
+
+const net::Endpoint& CodecStream::local_endpoint() const noexcept {
+    return _stream.local_endpoint();
+}
+
+const net::Endpoint& CodecStream::peer_endpoint() const noexcept {
+    return _stream.peer_endpoint();
 }
 
 Task<void> CodecStream::handshake_client() { co_await run_handshake(true); }
@@ -585,7 +593,7 @@ Task<void> CodecStream::flush_ciphertext() {
 }
 
 Task<std::size_t> CodecStream::read_some(std::span<char> buffer) {
-    if (!open()) {
+    if (!is_open()) {
         throw std::logic_error("corouv::transport::CodecStream is closed");
     }
     if (buffer.empty()) {
@@ -626,8 +634,12 @@ Task<std::size_t> CodecStream::read_some(std::span<char> buffer) {
     }
 }
 
+Task<void> CodecStream::write_all(std::span<const char> data) {
+    co_await write_all(std::string_view(data.data(), data.size()));
+}
+
 Task<void> CodecStream::write_all(std::string_view data) {
-    if (!open()) {
+    if (!is_open()) {
         throw std::logic_error("corouv::transport::CodecStream is closed");
     }
 
@@ -684,6 +696,8 @@ Task<std::string> CodecStream::read_until_eof(std::size_t max_bytes) {
 
     co_return out;
 }
+
+void CodecStream::shutdown_write() noexcept { _stream.shutdown_write(); }
 
 void CodecStream::close() noexcept { _stream.close(); }
 

@@ -19,34 +19,7 @@ using Error = corouv::http::Error;
 using Request = corouv::http::Request;
 using Response = corouv::http::Response;
 using Url = corouv::http::Url;
-
-class Connection {
-public:
-    explicit Connection(transport::CodecStream stream, Limits limits = {});
-
-    Connection(const Connection&) = delete;
-    Connection& operator=(const Connection&) = delete;
-    Connection(Connection&&) noexcept = default;
-    Connection& operator=(Connection&&) noexcept = default;
-
-    Task<std::optional<Request>> read_request();
-    Task<Response> read_response(std::string_view request_method = {});
-    Task<void> write_request(const Request& request,
-                             std::string_view default_host = {});
-    Task<void> write_response(const Response& response,
-                              std::string_view request_method = {});
-
-    [[nodiscard]] bool open() const noexcept;
-    transport::CodecStream& stream() noexcept { return _stream; }
-    const transport::CodecStream& stream() const noexcept { return _stream; }
-    void close() noexcept;
-
-private:
-    transport::CodecStream _stream;
-    Limits _limits;
-    std::string _buffer;
-    std::size_t _buffer_offset{0};
-};
+using Connection = corouv::http::Connection;
 
 struct ClientOptions {
     Limits limits{};
@@ -61,7 +34,7 @@ public:
     Task<void> connect(std::string host, std::uint16_t port);
     Task<Response> request(Request request);
 
-    [[nodiscard]] bool connected() const noexcept;
+    [[nodiscard]] bool is_connected() const noexcept;
     [[nodiscard]] const std::string& host() const noexcept { return _host; }
     [[nodiscard]] std::uint16_t port() const noexcept { return _port; }
 

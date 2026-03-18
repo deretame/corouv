@@ -1,4 +1,4 @@
-#include <corouv/fs.h>
+#include <corouv/file.h>
 #include <corouv/loop.h>
 #include <corouv/sync_wait.h>
 
@@ -9,7 +9,10 @@
 
 async_simple::coro::Lazy<void> demo_read_file(corouv::UvExecutor& ex,
                                               std::string path) {
-    const auto s = co_await corouv::fs::read_file(ex, path);
+    constexpr int kReadOnly = 0;
+    auto file = co_await corouv::io::open(path, kReadOnly);
+    const auto s = co_await file.read_all();
+    co_await file.close();
     std::cout << "[read_file] path=" << path << " bytes=" << s.size() << "\n";
 }
 

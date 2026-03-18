@@ -76,17 +76,21 @@ public:
     CodecStream(CodecStream&&) noexcept = default;
     CodecStream& operator=(CodecStream&&) noexcept = default;
 
-    [[nodiscard]] bool open() const noexcept;
+    [[nodiscard]] bool is_open() const noexcept;
     [[nodiscard]] uv_os_sock_t native_handle() const noexcept;
+    [[nodiscard]] const net::Endpoint& local_endpoint() const noexcept;
+    [[nodiscard]] const net::Endpoint& peer_endpoint() const noexcept;
 
     Task<void> handshake_client();
     Task<void> handshake_server();
 
     Task<std::size_t> read_some(std::span<char> buffer);
+    Task<void> write_all(std::span<const char> data);
     Task<void> write_all(std::string_view data);
     Task<std::string> read_until_eof(
         std::size_t max_bytes = 16 * 1024 * 1024);
 
+    void shutdown_write() noexcept;
     void close() noexcept;
 
 private:

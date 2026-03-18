@@ -176,11 +176,11 @@ Headers copy_headers(const phr_header* raw, std::size_t count) {
     return headers;
 }
 
-Task<std::size_t> read_more(net::TcpStream& stream, BufferCursor& buffer,
+Task<std::size_t> read_more(io::ByteStream& stream, BufferCursor& buffer,
                             std::size_t max_buffered, int error_status,
                             const char* message) {
     std::array<char, 4096> scratch{};
-    const auto n = co_await stream.read_some(
+    const auto n = co_await stream.recv_some(
         std::span<char>(scratch.data(), scratch.size()));
     if (n == 0) {
         co_return 0;
@@ -192,7 +192,7 @@ Task<std::size_t> read_more(net::TcpStream& stream, BufferCursor& buffer,
     co_return n;
 }
 
-Task<void> ensure_buffer(net::TcpStream& stream, BufferCursor& buffer,
+Task<void> ensure_buffer(io::ByteStream& stream, BufferCursor& buffer,
                          std::size_t wanted, std::size_t max_buffered,
                          int error_status, const char* message,
                          const char* eof_message) {
@@ -206,7 +206,7 @@ Task<void> ensure_buffer(net::TcpStream& stream, BufferCursor& buffer,
     co_return;
 }
 
-Task<std::string> read_line_crlf(net::TcpStream& stream, BufferCursor& buffer,
+Task<std::string> read_line_crlf(io::ByteStream& stream, BufferCursor& buffer,
                                  std::size_t max_line, int error_status,
                                  const char* too_large_message,
                                  const char* eof_message) {
@@ -231,7 +231,7 @@ Task<std::string> read_line_crlf(net::TcpStream& stream, BufferCursor& buffer,
     }
 }
 
-Task<std::string> read_fixed_body(net::TcpStream& stream, BufferCursor& buffer,
+Task<std::string> read_fixed_body(io::ByteStream& stream, BufferCursor& buffer,
                                   const Limits& limits, std::size_t size) {
     if (size > limits.max_body_bytes) {
         throw Error(413, "HTTP body too large");
@@ -242,7 +242,7 @@ Task<std::string> read_fixed_body(net::TcpStream& stream, BufferCursor& buffer,
     co_return buffer.take(size);
 }
 
-Task<std::string> read_chunked_body(net::TcpStream& stream, BufferCursor& buffer,
+Task<std::string> read_chunked_body(io::ByteStream& stream, BufferCursor& buffer,
                                     const Limits& limits) {
     std::string body;
 
@@ -300,7 +300,7 @@ Task<std::string> read_chunked_body(net::TcpStream& stream, BufferCursor& buffer
     }
 }
 
-Task<std::string> read_until_close_body(net::TcpStream& stream,
+Task<std::string> read_until_close_body(io::ByteStream& stream,
                                         BufferCursor& buffer,
                                         const Limits& limits) {
     std::string body(buffer.view());
@@ -308,7 +308,7 @@ Task<std::string> read_until_close_body(net::TcpStream& stream,
 
     std::array<char, 4096> scratch{};
     while (true) {
-        const auto n = co_await stream.read_some(
+        const auto n = co_await stream.recv_some(
             std::span<char>(scratch.data(), scratch.size()));
         if (n == 0) {
             stream.close();
@@ -346,19 +346,19 @@ void prepare_outgoing_headers(Headers& headers, bool keep_alive, bool chunked,
     }
 }
 
-Task<void> write_chunked_body(net::TcpStream& stream, std::string_view body) {
+Task<void> write_chunked_body(io::ByteStream& stream, std::string_view body) {
     if (body.empty()) {
-        co_await stream.write_all(std::string_view("0\r\n\r\n"));
+        co_await stream.send_all(std::string_view("0\r\n\r\n"));
         co_return;
     }
 
     char chunk_header[64] = {0};
     const int n = std::snprintf(chunk_header, sizeof(chunk_header), "%zx\r\n",
                                 static_cast<std::size_t>(body.size()));
-    co_await stream.write_all(
+    co_await stream.send_all(
         std::string_view(chunk_header, static_cast<std::size_t>(n)));
-    co_await stream.write_all(body);
-    co_await stream.write_all(std::string_view("\r\n0\r\n\r\n"));
+    co_await stream.send_all(body);
+    co_await stream.send_all(std::string_view("\r\n0\r\n\r\n"));
 }
 
 std::string serialize_headers(const Headers& headers) {
@@ -492,10 +492,10 @@ std::string reason_phrase(int status) {
     }
 }
 
-Connection::Connection(net::TcpStream stream, Limits limits)
+Connection::Connection(io::ByteStream stream, Limits limits)
     : _stream(std::move(stream)), _limits(limits) {}
 
-bool Connection::open() const noexcept { return _stream.open(); }
+bool Connection::is_open() const noexcept { return _stream.is_open(); }
 
 void Connection::close() noexcept { _stream.close(); }
 
@@ -656,12 +656,12 @@ Task<void> Connection::write_request(const Request& request,
     head.append(serialize_headers(outgoing.headers));
     head.append("\r\n");
 
-    co_await _stream.write_all(std::string_view(head));
+    co_await _stream.send_all(std::string_view(head));
 
     if (outgoing.chunked) {
         co_await write_chunked_body(_stream, outgoing.body);
     } else if (!outgoing.body.empty()) {
-        co_await _stream.write_all(std::string_view(outgoing.body));
+        co_await _stream.send_all(std::string_view(outgoing.body));
     }
 }
 
@@ -690,7 +690,7 @@ Task<void> Connection::write_response(const Response& response,
     head.append(serialize_headers(outgoing.headers));
     head.append("\r\n");
 
-    co_await _stream.write_all(std::string_view(head));
+    co_await _stream.send_all(std::string_view(head));
 
     if (!response_has_body(outgoing.status, request_method)) {
         co_return;
@@ -699,7 +699,7 @@ Task<void> Connection::write_response(const Response& response,
     if (outgoing.chunked) {
         co_await write_chunked_body(_stream, outgoing.body);
     } else if (!outgoing.body.empty()) {
-        co_await _stream.write_all(std::string_view(outgoing.body));
+        co_await _stream.send_all(std::string_view(outgoing.body));
     }
 }
 
@@ -707,19 +707,19 @@ Server::Server(UvExecutor& ex, Handler handler, ServerOptions options)
     : _ex(&ex), _handler(std::move(handler)), _options(std::move(options)) {}
 
 Task<void> Server::listen() {
-    if (_listener.has_value() && _listener->open()) {
+    if (_listener.has_value() && _listener->is_open()) {
         co_return;
     }
 
-    _listener =
-        co_await net::listen(*_ex, _options.host, _options.port, _options.backlog);
+    _listener = io::ByteListener(
+        co_await net::listen(*_ex, _options.host, _options.port, _options.backlog));
     co_return;
 }
 
-Task<void> Server::handle_client(net::TcpStream stream) {
+Task<void> Server::handle_client(io::ByteStream stream) {
     Connection conn(std::move(stream), _options.limits);
 
-    while (conn.open()) {
+    while (conn.is_open()) {
         Request request;
         std::optional<Response> request_error_response;
         try {
@@ -789,14 +789,21 @@ Task<void> Server::handle_client(net::TcpStream stream) {
 }
 
 Task<void> Server::serve() {
-    if (!_listener.has_value() || !_listener->open()) {
+    if (!_listener.has_value() || !_listener->is_open()) {
         co_await listen();
+    }
+
+    if (auto* slot = co_await async_simple::coro::CurrentSlot{}; slot != nullptr) {
+        (void)async_simple::signalHelper{async_simple::Terminate}.tryEmplace(
+            slot, [this](async_simple::SignalType, async_simple::Signal*) {
+                this->close();
+            });
     }
 
     auto connections = co_await corouv::make_task_group();
     std::exception_ptr failure;
 
-    while (_listener.has_value() && _listener->open()) {
+    while (_listener.has_value() && _listener->is_open()) {
         try {
             auto stream = co_await _listener->accept();
             if (!connections.spawn(handle_client(std::move(stream)))) {
@@ -807,7 +814,7 @@ Task<void> Server::serve() {
             connections.cancel();
             break;
         } catch (const std::logic_error&) {
-            if (!_listener.has_value() || !_listener->open()) {
+            if (!_listener.has_value() || !_listener->is_open()) {
                 break;
             }
             failure = std::current_exception();
@@ -840,14 +847,14 @@ void Server::close() noexcept {
 }
 
 std::uint16_t Server::port() const noexcept {
-    if (_listener.has_value() && _listener->open()) {
+    if (_listener.has_value() && _listener->is_open()) {
         return _listener->local_endpoint().port;
     }
     return _options.port;
 }
 
 std::string Server::host() const {
-    if (_listener.has_value() && _listener->open()) {
+    if (_listener.has_value() && _listener->is_open()) {
         return _listener->local_endpoint().host;
     }
     return _options.host;
@@ -867,7 +874,7 @@ Task<void> Client::connect(std::string host, std::uint16_t port) {
 }
 
 Task<Response> Client::request(Request request) {
-    if (!_connection || !_connection->open()) {
+    if (!_connection || !_connection->is_open()) {
         throw std::logic_error("corouv::http::Client is not connected");
     }
 
@@ -884,8 +891,8 @@ Task<Response> Client::request(Request request) {
     co_return response;
 }
 
-bool Client::connected() const noexcept {
-    return _connection != nullptr && _connection->open();
+bool Client::is_connected() const noexcept {
+    return _connection != nullptr && _connection->is_open();
 }
 
 void Client::close() noexcept {
@@ -896,13 +903,20 @@ void Client::close() noexcept {
 }
 
 Url parse_url(std::string_view url) {
-    constexpr std::string_view prefix = "http://";
-    if (!url.starts_with(prefix)) {
-        throw std::invalid_argument("corouv::http::parse_url only supports http://");
-    }
-
     Url parsed;
-    auto remainder = url.substr(prefix.size());
+    std::string_view remainder;
+    if (url.starts_with("http://")) {
+        parsed.scheme = "http";
+        parsed.port = 80;
+        remainder = url.substr(std::string_view("http://").size());
+    } else if (url.starts_with("https://")) {
+        parsed.scheme = "https";
+        parsed.port = 443;
+        remainder = url.substr(std::string_view("https://").size());
+    } else {
+        throw std::invalid_argument(
+            "corouv::http::parse_url only supports http:// and https://");
+    }
 
     const auto authority_end = remainder.find_first_of("/?#");
     const auto authority =
@@ -966,7 +980,7 @@ Url parse_url(std::string_view url) {
     }
 
     parsed.host.assign(host);
-    parsed.port = port.value_or(80);
+    parsed.port = port.value_or(parsed.port);
 
     if (remainder.empty()) {
         parsed.target = "/";
@@ -991,6 +1005,9 @@ Url parse_url(std::string_view url) {
 Task<Response> fetch(UvExecutor& ex, std::string_view url, Request request,
                      ClientOptions options) {
     const auto parsed = parse_url(url);
+    if (parsed.scheme != "http") {
+        throw std::invalid_argument("corouv::http::fetch requires http:// URL");
+    }
     if (request.target.empty() || request.target == "/") {
         request.target = parsed.target;
     }

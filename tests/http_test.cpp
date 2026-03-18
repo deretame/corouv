@@ -51,7 +51,7 @@ corouv::Task<void> close_body_server_task(corouv::net::TcpListener* listener) {
         throw std::runtime_error("http_test: close request mismatch");
     }
 
-    co_await conn.stream().write_all(
+    co_await conn.stream().send_all(
         std::string_view("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nclose-body"));
     conn.close();
     listener->close();
@@ -157,7 +157,7 @@ corouv::Task<void> connection_close_body_case(corouv::UvExecutor& ex) {
     if (response.body != "close-body") {
         throw std::runtime_error("http_test: close-delimited body mismatch");
     }
-    if (client.connected()) {
+    if (client.is_connected()) {
         throw std::runtime_error("http_test: client should close after response");
     }
 }

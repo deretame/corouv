@@ -1,12 +1,11 @@
 #include <corouv/fs.h>
+#include <corouv/filesystem.h>
 #include <corouv/runtime.h>
 
-#include <filesystem>
 #include <cstddef>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <system_error>
 
 corouv::Task<void> fs_roundtrip(corouv::UvExecutor& ex, const std::string& path) {
     static constexpr const char kPayload[] = "corouv-fs-roundtrip\n";
@@ -35,12 +34,18 @@ int main() {
         corouv::Runtime rt;
         rt.run(fs_roundtrip(rt.executor(), path));
     } catch (...) {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
+        try {
+            corouv::Runtime cleanup_rt;
+            cleanup_rt.run(corouv::io::remove_all(cleanup_rt.executor(), path));
+        } catch (...) {
+        }
         throw;
     }
 
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
+    try {
+        corouv::Runtime cleanup_rt;
+        cleanup_rt.run(corouv::io::remove_all(cleanup_rt.executor(), path));
+    } catch (...) {
+    }
     return 0;
 }

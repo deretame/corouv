@@ -11,6 +11,10 @@
 
 using namespace std::chrono_literals;
 
+// This test intentionally uses raw POSIX fd operations only as a minimal
+// harness for corouv::poll. It is not the recommended application-facing I/O
+// style for the library; production code should stay on top of corouv/libuv
+// wrappers.
 corouv::Task<void> poll_task(corouv::UvExecutor& ex, int read_fd, int write_fd) {
     std::jthread writer([write_fd]() {
         std::this_thread::sleep_for(30ms);
@@ -31,6 +35,8 @@ corouv::Task<void> poll_task(corouv::UvExecutor& ex, int read_fd, int write_fd) 
 
 int main() {
     int fds[2] = {-1, -1};
+    // socketpair + raw read/write/close are test fixtures here, used only to
+    // drive readiness transitions for the poll adapter.
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
         throw std::runtime_error("poll_test: socketpair failed");
     }
@@ -48,4 +54,3 @@ int main() {
     ::close(fds[1]);
     return 0;
 }
-

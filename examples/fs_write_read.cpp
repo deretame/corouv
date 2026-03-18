@@ -1,26 +1,25 @@
-#include <corouv/fs.h>
+#include <corouv/file.h>
 #include <corouv/runtime.h>
 
 #include <iostream>
-#include <span>
 #include <stdexcept>
 #include <string>
 
 corouv::Task<void> write_then_read(corouv::UvExecutor& ex, std::string path) {
     const std::string payload = "hello from corouv fs\n";
 
-    uv_file file = co_await corouv::fs::Open(
-        ex.loop(), path, UV_FS_O_CREAT | UV_FS_O_TRUNC | UV_FS_O_WRONLY, 0644);
+    auto file = co_await corouv::io::open(
+        ex, path, UV_FS_O_CREAT | UV_FS_O_TRUNC | UV_FS_O_RDWR, 0644);
+    co_await file.write_all(payload);
+    file.rewind();
 
-    const std::span<const char> buf(payload.data(), payload.size());
-    const ssize_t n = co_await corouv::fs::Write(ex.loop(), file, buf, 0);
-    co_await corouv::fs::Close(ex.loop(), file);
+    const std::string out = co_await file.read_all();
+    co_await file.close();
 
-    if (n != static_cast<ssize_t>(payload.size())) {
-        throw std::runtime_error("fs_write_read: short write");
+    if (out != payload) {
+        throw std::runtime_error("fs_write_read: content mismatch");
     }
 
-    const std::string out = co_await corouv::fs::read_file(ex, path);
     std::cout << "[fs_write_read] path=" << path << " bytes=" << out.size()
               << "\n";
     std::cout << "[fs_write_read] content=" << out;

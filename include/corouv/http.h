@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "corouv/executor.h"
+#include "corouv/io.h"
 #include "corouv/net.h"
 #include "corouv/task.h"
 
@@ -71,7 +72,7 @@ struct Response {
 
 class Connection {
 public:
-    explicit Connection(net::TcpStream stream, Limits limits = {});
+    explicit Connection(io::ByteStream stream, Limits limits = {});
 
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
@@ -85,13 +86,13 @@ public:
     Task<void> write_response(const Response& response,
                               std::string_view request_method = {});
 
-    [[nodiscard]] bool open() const noexcept;
-    net::TcpStream& stream() noexcept { return _stream; }
-    const net::TcpStream& stream() const noexcept { return _stream; }
+    [[nodiscard]] bool is_open() const noexcept;
+    io::ByteStream& stream() noexcept { return _stream; }
+    const io::ByteStream& stream() const noexcept { return _stream; }
     void close() noexcept;
 
 private:
-    net::TcpStream _stream;
+    io::ByteStream _stream;
     Limits _limits;
     std::string _buffer;
     std::size_t _buffer_offset{0};
@@ -118,12 +119,12 @@ public:
     [[nodiscard]] std::string host() const;
 
 private:
-    Task<void> handle_client(net::TcpStream stream);
+    Task<void> handle_client(io::ByteStream stream);
 
     UvExecutor* _ex = nullptr;
     Handler _handler;
     ServerOptions _options;
-    std::optional<net::TcpListener> _listener;
+    std::optional<io::ByteListener> _listener;
 };
 
 struct ClientOptions {
@@ -138,7 +139,7 @@ public:
     Task<void> connect(std::string host, std::uint16_t port);
     Task<Response> request(Request request);
 
-    [[nodiscard]] bool connected() const noexcept;
+    [[nodiscard]] bool is_connected() const noexcept;
     [[nodiscard]] const std::string& host() const noexcept { return _host; }
     [[nodiscard]] std::uint16_t port() const noexcept { return _port; }
 

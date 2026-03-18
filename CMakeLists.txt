@@ -40,6 +40,7 @@ target_link_libraries(async_simple INTERFACE Threads::Threads)
 # -----------------------
 add_library(corouv
   src/http.cpp
+  src/https.cpp
   src/multipart.cpp
   src/net.cpp
   src/transport.cpp
@@ -68,9 +69,13 @@ target_include_directories(corouv PRIVATE
 target_compile_features(corouv PUBLIC cxx_std_20)
 
 if (MSVC)
-  target_compile_options(corouv PRIVATE /W4)
+  target_compile_options(corouv PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:/W4>
+  )
 else()
-  target_compile_options(corouv PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(corouv PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>
+  )
 endif()
 
 # -----------------------
