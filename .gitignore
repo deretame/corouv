@@ -12,3 +12,4 @@ bin/
 .idea/
 cmake-build-*/
 third_party/*
+*/__pycache__/*

@@ -55,9 +55,48 @@ std::string unquote(std::string_view value) {
     return trim_copy(value);
 }
 
+std::string decode_percent_escaped(std::string_view value) {
+    auto hex_value = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') {
+            return ch - '0';
+        }
+        if (ch >= 'a' && ch <= 'f') {
+            return 10 + (ch - 'a');
+        }
+        if (ch >= 'A' && ch <= 'F') {
+            return 10 + (ch - 'A');
+        }
+        return -1;
+    };
+
+    std::string out;
+    out.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != '%') {
+            out.push_back(value[i]);
+            continue;
+        }
+
+        if (i + 2 >= value.size()) {
+            throw std::runtime_error("corouv::multipart invalid percent-encoding");
+        }
+        const int hi = hex_value(value[i + 1]);
+        const int lo = hex_value(value[i + 2]);
+        if (hi < 0 || lo < 0) {
+            throw std::runtime_error("corouv::multipart invalid percent-encoding");
+        }
+
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+    }
+    return out;
+}
+
 void parse_content_disposition(Part& part, std::string_view value) {
     std::size_t start = 0;
     bool first = true;
+    std::optional<std::string> filename;
+    std::optional<std::string> filename_ext;
 
     while (start < value.size()) {
         const auto semi = value.find(';', start);
@@ -90,8 +129,25 @@ void parse_content_disposition(Part& part, std::string_view value) {
         if (iequals(key, "name")) {
             part.name = parsed_value;
         } else if (iequals(key, "filename")) {
-            part.filename = parsed_value;
+            filename = parsed_value;
+        } else if (iequals(key, "filename*")) {
+            const auto first_quote = parsed_value.find('\'');
+            const auto second_quote =
+                first_quote == std::string::npos
+                    ? std::string::npos
+                    : parsed_value.find('\'', first_quote + 1);
+            const auto encoded =
+                second_quote == std::string::npos
+                    ? std::string_view(parsed_value)
+                    : std::string_view(parsed_value).substr(second_quote + 1);
+            filename_ext = decode_percent_escaped(encoded);
         }
+    }
+
+    if (filename_ext.has_value()) {
+        part.filename = std::move(filename_ext);
+    } else if (filename.has_value()) {
+        part.filename = std::move(filename);
     }
 }
 
@@ -101,14 +157,12 @@ corouv::http::Headers parse_headers_block(std::string_view block) {
 
     while (pos < block.size()) {
         const auto end = block.find("\r\n", pos);
-        if (end == std::string_view::npos) {
-            throw std::runtime_error("corouv::multipart malformed header block");
-        }
-        if (end == pos) {
+        const auto line =
+            end == std::string_view::npos ? block.substr(pos)
+                                          : block.substr(pos, end - pos);
+        if (line.empty()) {
             break;
         }
-
-        const auto line = block.substr(pos, end - pos);
         const auto colon = line.find(':');
         if (colon == std::string_view::npos) {
             throw std::runtime_error("corouv::multipart malformed part header");
@@ -118,6 +172,10 @@ corouv::http::Headers parse_headers_block(std::string_view block) {
             trim_copy(line.substr(0, colon)),
             trim_copy(line.substr(colon + 1)),
         });
+
+        if (end == std::string_view::npos) {
+            break;
+        }
         pos = end + 2;
     }
 
@@ -168,7 +226,7 @@ std::optional<std::string> boundary_from_content_type(
 }
 
 FormData parse(std::string_view content_type, std::string_view body,
-               std::size_t max_parts) {
+               std::size_t max_parts, std::size_t max_part_bytes) {
     const auto boundary = boundary_from_content_type(content_type);
     if (!boundary.has_value() || boundary->empty()) {
         throw std::runtime_error(
@@ -222,6 +280,9 @@ FormData parse(std::string_view content_type, std::string_view body,
         }
 
         part.body.assign(body.substr(cursor, next - cursor));
+        if (part.body.size() > max_part_bytes) {
+            throw std::runtime_error("corouv::multipart part body too large");
+        }
         form.parts.push_back(std::move(part));
 
         if (form.parts.size() > max_parts) {
@@ -238,14 +299,14 @@ FormData parse(std::string_view content_type, std::string_view body,
 }
 
 FormData parse_request(const corouv::http::Request& request,
-                       std::size_t max_parts) {
+                       std::size_t max_parts, std::size_t max_part_bytes) {
     const auto content_type =
         corouv::http::find_header(request.headers, "Content-Type");
     if (!content_type.has_value()) {
         throw std::runtime_error(
             "corouv::multipart request missing Content-Type header");
     }
-    return parse(*content_type, request.body, max_parts);
+    return parse(*content_type, request.body, max_parts, max_part_bytes);
 }
 
 std::string build_content_type(std::string_view boundary) {

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -15,9 +17,72 @@
 
 #include "corouv/http.h"
 #include "corouv/https.h"
+#include "corouv/multipart.h"
 #include "corouv/transport.h"
 
 namespace corouv::web {
+
+using Header = corouv::http::Header;
+using Headers = corouv::http::Headers;
+using Limits = corouv::http::Limits;
+using Error = corouv::http::Error;
+using Request = corouv::http::Request;
+using Response = corouv::http::Response;
+using Url = corouv::http::Url;
+using FormField = corouv::http::FormField;
+using FormFields = corouv::http::FormFields;
+using MultipartPart = corouv::multipart::Part;
+using MultipartFormData = corouv::multipart::FormData;
+using corouv::http::reason_phrase;
+
+struct Param {
+    std::string name;
+    std::string value;
+};
+
+using Params = std::vector<Param>;
+
+struct RequestContext {
+    Request request;
+    Params params;
+
+    [[nodiscard]] std::optional<std::string_view> param(
+        std::string_view name) const noexcept {
+        for (const auto& entry : params) {
+            if (entry.name == name) {
+                return entry.value;
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] bool has_param(std::string_view name) const noexcept {
+        return param(name).has_value();
+    }
+
+    [[nodiscard]] std::string_view path() const noexcept {
+        const std::string_view target(request.target);
+        const auto q = target.find('?');
+        return target.substr(
+            0, q == std::string_view::npos ? target.size() : q);
+    }
+
+    [[nodiscard]] FormFields parse_form(std::size_t max_fields = 1024) const {
+        return corouv::http::parse_form_urlencoded_request(request, max_fields);
+    }
+
+    [[nodiscard]] MultipartFormData parse_multipart(
+        std::size_t max_parts = 256,
+        std::size_t max_part_bytes = 8 * 1024 * 1024) const {
+        return corouv::multipart::parse_request(request, max_parts,
+                                                max_part_bytes);
+    }
+};
+
+using RequestHandler = std::function<Task<Response>(Request)>;
+using Handler = std::function<Task<Response>(RequestContext)>;
+using Next = std::function<Task<Response>(RequestContext)>;
+using Middleware = std::function<Task<Response>(RequestContext, Next)>;
 
 namespace detail {
 
@@ -38,19 +103,6 @@ inline bool iequals(std::string_view lhs, std::string_view rhs) noexcept {
 inline std::string_view request_path(std::string_view target) noexcept {
     const auto q = target.find('?');
     return target.substr(0, q == std::string_view::npos ? target.size() : q);
-}
-
-inline bool prefix_matches(std::string_view path, std::string_view prefix) noexcept {
-    if (!path.starts_with(prefix)) {
-        return false;
-    }
-    if (path.size() == prefix.size()) {
-        return true;
-    }
-    if (prefix.empty() || prefix.back() == '/') {
-        return true;
-    }
-    return path[prefix.size()] == '/';
 }
 
 template <class>
@@ -90,12 +142,35 @@ inline MatchResult match_route(std::string_view path, std::string_view pattern,
                                bool prefix) {
     const auto path_parts = split_path_segments(path);
     const auto pattern_parts = split_path_segments(pattern);
+    std::optional<std::size_t> wildcard_index;
+    for (std::size_t i = 0; i < pattern_parts.size(); ++i) {
+        if (pattern_parts[i] == "*") {
+            wildcard_index = i;
+            break;
+        }
+    }
 
-    if (!prefix && path_parts.size() != pattern_parts.size()) {
+    if (wildcard_index.has_value() &&
+        *wildcard_index + 1 != pattern_parts.size()) {
         return {};
     }
-    if (prefix && path_parts.size() < pattern_parts.size()) {
-        return {};
+
+    if (prefix) {
+        if (wildcard_index.has_value()) {
+            if (path_parts.size() < *wildcard_index) {
+                return {};
+            }
+        } else if (path_parts.size() < pattern_parts.size()) {
+            return {};
+        }
+    } else {
+        if (wildcard_index.has_value()) {
+            if (path_parts.size() < *wildcard_index) {
+                return {};
+            }
+        } else if (path_parts.size() != pattern_parts.size()) {
+            return {};
+        }
     }
 
     MatchResult out;
@@ -104,16 +179,6 @@ inline MatchResult match_route(std::string_view path, std::string_view pattern,
 
     for (std::size_t i = 0; i < pattern_parts.size(); ++i) {
         const auto pat = pattern_parts[i];
-        const auto seg = path_parts[i];
-
-        if (!pat.empty() && pat.front() == ':' && pat.size() > 1) {
-            out.params.push_back(Param{
-                .name = std::string(pat.substr(1)),
-                .value = std::string(seg),
-            });
-            continue;
-        }
-
         if (pat == "*") {
             std::string tail;
             for (std::size_t j = i; j < path_parts.size(); ++j) {
@@ -127,13 +192,31 @@ inline MatchResult match_route(std::string_view path, std::string_view pattern,
                 .value = std::move(tail),
             });
             out.matched = true;
-            out.matched_segments = path_parts.size();
+            out.matched_segments = i;
             return out;
+        }
+
+        if (i >= path_parts.size()) {
+            return {};
+        }
+
+        const auto seg = path_parts[i];
+
+        if (!pat.empty() && pat.front() == ':' && pat.size() > 1) {
+            out.params.push_back(Param{
+                .name = std::string(pat.substr(1)),
+                .value = std::string(seg),
+            });
+            continue;
         }
 
         if (pat != seg) {
             return {};
         }
+    }
+
+    if (!prefix && path_parts.size() != pattern_parts.size()) {
+        return {};
     }
 
     out.matched = true;
@@ -193,54 +276,11 @@ Middleware to_middleware(Fn&& fn) {
 
 }  // namespace detail
 
-using Header = corouv::http::Header;
-using Headers = corouv::http::Headers;
-using Limits = corouv::http::Limits;
-using Error = corouv::http::Error;
-using Request = corouv::http::Request;
-using Response = corouv::http::Response;
-using Url = corouv::http::Url;
-using corouv::http::reason_phrase;
-
-struct Param {
-    std::string name;
-    std::string value;
-};
-
-using Params = std::vector<Param>;
-
-struct RequestContext {
-    Request request;
-    Params params;
-
-    [[nodiscard]] std::optional<std::string_view> param(
-        std::string_view name) const noexcept {
-        for (const auto& entry : params) {
-            if (entry.name == name) {
-                return entry.value;
-            }
-        }
-        return std::nullopt;
-    }
-
-    [[nodiscard]] bool has_param(std::string_view name) const noexcept {
-        return param(name).has_value();
-    }
-
-    [[nodiscard]] std::string_view path() const noexcept {
-        return detail::request_path(request.target);
-    }
-};
-
-using RequestHandler = std::function<Task<Response>(Request)>;
-using Handler = std::function<Task<Response>(RequestContext)>;
-using Next = std::function<Task<Response>(RequestContext)>;
-using Middleware = std::function<Task<Response>(RequestContext, Next)>;
-
 struct ClientOptions {
     Limits limits{};
     bool keep_alive{true};
     transport::TlsClientConfig tls;
+    corouv::http::IoTimeouts timeouts{};
 };
 
 struct ServerOptions {
@@ -249,12 +289,14 @@ struct ServerOptions {
     int backlog{128};
     Limits limits{};
     std::optional<transport::TlsServerConfig> tls;
+    corouv::http::IoTimeouts timeouts{};
 };
 
 inline corouv::http::ClientOptions to_http_options(const ClientOptions& options) {
     return corouv::http::ClientOptions{
         .limits = options.limits,
         .keep_alive = options.keep_alive,
+        .timeouts = options.timeouts,
     };
 }
 
@@ -264,6 +306,7 @@ inline corouv::https::ClientOptions to_https_options(
         .limits = options.limits,
         .tls = options.tls,
         .keep_alive = options.keep_alive,
+        .timeouts = options.timeouts,
     };
 }
 
@@ -378,6 +421,26 @@ public:
         return *this;
     }
 
+    ClientBuilder& read_headers_timeout(std::chrono::milliseconds value) {
+        _options.timeouts.read_headers = value;
+        return *this;
+    }
+
+    ClientBuilder& read_body_timeout(std::chrono::milliseconds value) {
+        _options.timeouts.read_body = value;
+        return *this;
+    }
+
+    ClientBuilder& write_timeout(std::chrono::milliseconds value) {
+        _options.timeouts.write = value;
+        return *this;
+    }
+
+    ClientBuilder& clear_timeouts() {
+        _options.timeouts = {};
+        return *this;
+    }
+
     ClientBuilder& tls(transport::TlsClientConfig config) {
         _options.tls = std::move(config);
         return *this;
@@ -462,76 +525,184 @@ private:
 
 class Router {
 public:
-    using Handler = Server::Handler;
+    using Handler = web::Handler;
+    using ServerHandler = Server::Handler;
 
     Router() : _state(std::make_shared<State>()) {}
 
-    Router& route(std::optional<std::string> method, std::string path,
-                  Handler handler, bool prefix = false) {
+    template <class Fn>
+    Router& route(std::optional<std::string> method, std::string path, Fn&& fn,
+                  bool prefix = false) {
+        return add_route(std::move(method), std::move(path),
+                         detail::to_handler(std::forward<Fn>(fn)), prefix,
+                         false);
+    }
+
+    template <class Fn>
+    Router& any(std::string path, Fn&& fn) {
+        return route(std::nullopt, std::move(path), std::forward<Fn>(fn), false);
+    }
+
+    template <class Fn>
+    Router& get(std::string path, Fn&& fn) {
+        return route(std::string("GET"), std::move(path), std::forward<Fn>(fn),
+                     false);
+    }
+
+    template <class Fn>
+    Router& post(std::string path, Fn&& fn) {
+        return route(std::string("POST"), std::move(path), std::forward<Fn>(fn),
+                     false);
+    }
+
+    template <class Fn>
+    Router& put(std::string path, Fn&& fn) {
+        return route(std::string("PUT"), std::move(path), std::forward<Fn>(fn),
+                     false);
+    }
+
+    template <class Fn>
+    Router& patch(std::string path, Fn&& fn) {
+        return route(std::string("PATCH"), std::move(path), std::forward<Fn>(fn),
+                     false);
+    }
+
+    template <class Fn>
+    Router& delete_(std::string path, Fn&& fn) {
+        return route(std::string("DELETE"), std::move(path), std::forward<Fn>(fn),
+                     false);
+    }
+
+    template <class Fn>
+    Router& prefix(std::string path, Fn&& fn) {
+        return route(std::nullopt, std::move(path), std::forward<Fn>(fn), true);
+    }
+
+    Router& mount(std::string path, Router router) {
+        auto mounted_state = router._state;
+        return add_route(
+            std::nullopt, std::move(path),
+            [mounted_state](RequestContext ctx) -> Task<Response> {
+                Router mounted;
+                mounted._state = mounted_state;
+                co_return co_await mounted.handle_context(std::move(ctx));
+            },
+            true, true);
+    }
+
+    template <class Fn>
+    Router& use(Fn&& fn) {
+        _state->middlewares.push_back(detail::to_middleware(std::forward<Fn>(fn)));
+        return *this;
+    }
+
+    template <class Fn>
+    Router& not_found(Fn&& fn) {
+        _state->not_found = detail::to_handler(std::forward<Fn>(fn));
+        return *this;
+    }
+
+    Task<Response> handle(Request request) const {
+        RequestContext ctx;
+        ctx.request = std::move(request);
+        co_return co_await handle_context(std::move(ctx));
+    }
+
+    [[nodiscard]] ServerHandler handler() const {
+        auto state = _state;
+        return [state](Request request) -> Task<Response> {
+            Router router;
+            router._state = state;
+            co_return co_await router.handle(std::move(request));
+        };
+    }
+
+private:
+    Router& add_route(std::optional<std::string> method, std::string path,
+                      Handler handler, bool prefix, bool strip_prefix) {
         _state->routes.push_back(Route{
             .method = std::move(method),
             .path = std::move(path),
             .handler = std::move(handler),
             .prefix = prefix,
+            .strip_prefix = strip_prefix,
         });
         return *this;
     }
 
-    Router& any(std::string path, Handler handler) {
-        return route(std::nullopt, std::move(path), std::move(handler), false);
+    Task<Response> handle_context(RequestContext ctx) const {
+        Next next = [state = _state](RequestContext inner) -> Task<Response> {
+            Router router;
+            router._state = state;
+            co_return co_await router.dispatch(std::move(inner));
+        };
+
+        for (auto it = _state->middlewares.rbegin();
+             it != _state->middlewares.rend(); ++it) {
+            const auto middleware = *it;
+            const auto prev = next;
+            next = [middleware, prev](RequestContext inner) -> Task<Response> {
+                co_return co_await middleware(std::move(inner), prev);
+            };
+        }
+
+        co_return co_await next(std::move(ctx));
     }
 
-    Router& get(std::string path, Handler handler) {
-        return route(std::string("GET"), std::move(path), std::move(handler), false);
-    }
+    Task<Response> dispatch(RequestContext ctx) const {
+        const auto path = detail::request_path(ctx.request.target);
+        std::vector<std::string> allowed_methods;
 
-    Router& post(std::string path, Handler handler) {
-        return route(std::string("POST"), std::move(path), std::move(handler), false);
-    }
-
-    Router& put(std::string path, Handler handler) {
-        return route(std::string("PUT"), std::move(path), std::move(handler), false);
-    }
-
-    Router& patch(std::string path, Handler handler) {
-        return route(std::string("PATCH"), std::move(path), std::move(handler), false);
-    }
-
-    Router& delete_(std::string path, Handler handler) {
-        return route(std::string("DELETE"), std::move(path), std::move(handler),
-                     false);
-    }
-
-    Router& prefix(std::string path, Handler handler) {
-        return route(std::nullopt, std::move(path), std::move(handler), true);
-    }
-
-    Router& not_found(Handler handler) {
-        _state->not_found = std::move(handler);
-        return *this;
-    }
-
-    Task<Response> handle(Request request) const {
-        const auto path = detail::request_path(request.target);
+        auto add_allowed_method = [&allowed_methods](std::string_view method) {
+            for (const auto& existing : allowed_methods) {
+                if (detail::iequals(existing, method)) {
+                    return;
+                }
+            }
+            allowed_methods.push_back(std::string(method));
+        };
 
         for (const auto& route : _state->routes) {
+            auto match = detail::match_route(path, route.path, route.prefix);
+            if (!match.matched) {
+                continue;
+            }
+
             if (route.method.has_value() &&
-                !detail::iequals(request.method, *route.method)) {
+                !detail::iequals(ctx.request.method, *route.method)) {
+                add_allowed_method(*route.method);
                 continue;
             }
 
-            const bool matched =
-                route.prefix ? detail::prefix_matches(path, route.path)
-                             : path == route.path;
-            if (!matched) {
-                continue;
+            detail::append_params(ctx.params, std::move(match.params));
+            if (route.strip_prefix) {
+                ctx.request.target = detail::strip_matched_prefix(
+                    ctx.request.target, match.matched_segments);
             }
 
-            co_return co_await route.handler(std::move(request));
+            co_return co_await route.handler(std::move(ctx));
+        }
+
+        if (!allowed_methods.empty()) {
+            Response response;
+            response.status = 405;
+            response.reason = corouv::http::reason_phrase(405);
+            response.body = "method not allowed";
+            response.keep_alive = false;
+
+            std::string allow;
+            for (std::size_t i = 0; i < allowed_methods.size(); ++i) {
+                if (i > 0) {
+                    allow.append(", ");
+                }
+                allow.append(allowed_methods[i]);
+            }
+            corouv::http::set_header(response.headers, "Allow", std::move(allow));
+            co_return response;
         }
 
         if (_state->not_found.has_value()) {
-            co_return co_await (*_state->not_found)(std::move(request));
+            co_return co_await (*_state->not_found)(std::move(ctx));
         }
 
         Response response;
@@ -542,25 +713,17 @@ public:
         co_return response;
     }
 
-    [[nodiscard]] Handler handler() const {
-        auto state = _state;
-        return [state](Request request) -> Task<Response> {
-            Router router;
-            router._state = state;
-            co_return co_await router.handle(std::move(request));
-        };
-    }
-
-private:
     struct Route {
         std::optional<std::string> method;
         std::string path;
         Handler handler;
         bool prefix{false};
+        bool strip_prefix{false};
     };
 
     struct State {
         std::vector<Route> routes;
+        std::vector<Middleware> middlewares;
         std::optional<Handler> not_found;
     };
 
@@ -601,6 +764,26 @@ public:
         return *this;
     }
 
+    ServerBuilder& read_headers_timeout(std::chrono::milliseconds value) {
+        _options.timeouts.read_headers = value;
+        return *this;
+    }
+
+    ServerBuilder& read_body_timeout(std::chrono::milliseconds value) {
+        _options.timeouts.read_body = value;
+        return *this;
+    }
+
+    ServerBuilder& write_timeout(std::chrono::milliseconds value) {
+        _options.timeouts.write = value;
+        return *this;
+    }
+
+    ServerBuilder& clear_timeouts() {
+        _options.timeouts = {};
+        return *this;
+    }
+
     ServerBuilder& handle(Handler handler) {
         _handler = std::move(handler);
         return *this;
@@ -616,50 +799,70 @@ public:
         return *this;
     }
 
+    template <class Fn>
     ServerBuilder& route(std::optional<std::string> method, std::string path,
-                         Handler handler, bool prefix = false) {
+                         Fn&& fn, bool prefix = false) {
         ensure_router().route(std::move(method), std::move(path),
-                              std::move(handler), prefix);
+                              std::forward<Fn>(fn), prefix);
         return *this;
     }
 
-    ServerBuilder& any(std::string path, Handler handler) {
-        ensure_router().any(std::move(path), std::move(handler));
+    template <class Fn>
+    ServerBuilder& any(std::string path, Fn&& fn) {
+        ensure_router().any(std::move(path), std::forward<Fn>(fn));
         return *this;
     }
 
-    ServerBuilder& get(std::string path, Handler handler) {
-        ensure_router().get(std::move(path), std::move(handler));
+    template <class Fn>
+    ServerBuilder& get(std::string path, Fn&& fn) {
+        ensure_router().get(std::move(path), std::forward<Fn>(fn));
         return *this;
     }
 
-    ServerBuilder& post(std::string path, Handler handler) {
-        ensure_router().post(std::move(path), std::move(handler));
+    template <class Fn>
+    ServerBuilder& post(std::string path, Fn&& fn) {
+        ensure_router().post(std::move(path), std::forward<Fn>(fn));
         return *this;
     }
 
-    ServerBuilder& put(std::string path, Handler handler) {
-        ensure_router().put(std::move(path), std::move(handler));
+    template <class Fn>
+    ServerBuilder& put(std::string path, Fn&& fn) {
+        ensure_router().put(std::move(path), std::forward<Fn>(fn));
         return *this;
     }
 
-    ServerBuilder& patch(std::string path, Handler handler) {
-        ensure_router().patch(std::move(path), std::move(handler));
+    template <class Fn>
+    ServerBuilder& patch(std::string path, Fn&& fn) {
+        ensure_router().patch(std::move(path), std::forward<Fn>(fn));
         return *this;
     }
 
-    ServerBuilder& delete_(std::string path, Handler handler) {
-        ensure_router().delete_(std::move(path), std::move(handler));
+    template <class Fn>
+    ServerBuilder& delete_(std::string path, Fn&& fn) {
+        ensure_router().delete_(std::move(path), std::forward<Fn>(fn));
         return *this;
     }
 
-    ServerBuilder& prefix(std::string path, Handler handler) {
-        ensure_router().prefix(std::move(path), std::move(handler));
+    template <class Fn>
+    ServerBuilder& prefix(std::string path, Fn&& fn) {
+        ensure_router().prefix(std::move(path), std::forward<Fn>(fn));
         return *this;
     }
 
-    ServerBuilder& not_found(Handler handler) {
-        ensure_router().not_found(std::move(handler));
+    ServerBuilder& mount(std::string path, Router router) {
+        ensure_router().mount(std::move(path), std::move(router));
+        return *this;
+    }
+
+    template <class Fn>
+    ServerBuilder& use(Fn&& fn) {
+        ensure_router().use(std::forward<Fn>(fn));
+        return *this;
+    }
+
+    template <class Fn>
+    ServerBuilder& not_found(Fn&& fn) {
+        ensure_router().not_found(std::forward<Fn>(fn));
         return *this;
     }
 
@@ -692,6 +895,7 @@ public:
                     .backlog = _options.backlog,
                     .limits = _options.limits,
                     .tls = *_options.tls,
+                    .timeouts = _options.timeouts,
                 }));
         }
 
@@ -702,6 +906,7 @@ public:
                 .port = _options.port,
                 .backlog = _options.backlog,
                 .limits = _options.limits,
+                .timeouts = _options.timeouts,
             }));
     }
 

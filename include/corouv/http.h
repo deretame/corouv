@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -55,6 +56,7 @@ struct Request {
     std::string target{"/"};
     Headers headers;
     std::string body;
+    Headers trailers;
     int version_minor{1};
     bool keep_alive{true};
     bool chunked{false};
@@ -65,26 +67,85 @@ struct Response {
     std::string reason;
     Headers headers;
     std::string body;
+    Headers trailers;
     int version_minor{1};
     bool keep_alive{true};
     bool chunked{false};
 };
 
+struct FormField {
+    std::string name;
+    std::string value;
+};
+
+using FormFields = std::vector<FormField>;
+// Streaming body callback used by read_*_stream APIs.
+// Called with each decoded body chunk.
+using BodySink = std::function<Task<void>(std::string_view)>;
+// Streaming body producer used by write_*_stream APIs.
+// Return std::nullopt to signal end-of-body.
+using BodyChunkSource = std::function<Task<std::optional<std::string>>()>;
+
+// Optional per-operation timeouts.
+// - read_headers: request/response head parse stage.
+// - read_body: body read stage (fixed/chunked/close-delimited).
+// - write: header/body writes.
+struct IoTimeouts {
+    std::optional<std::chrono::milliseconds> read_headers;
+    std::optional<std::chrono::milliseconds> read_body;
+    std::optional<std::chrono::milliseconds> write;
+};
+
+// Form helpers for application/x-www-form-urlencoded.
+bool is_form_urlencoded_content_type(std::string_view content_type);
+std::string form_urlencode(std::string_view value);
+std::string form_urldecode(std::string_view value);
+FormFields parse_form_urlencoded(std::string_view body,
+                                 std::size_t max_fields = 1024);
+FormFields parse_form_urlencoded_request(const Request& request,
+                                         std::size_t max_fields = 1024);
+std::string serialize_form_urlencoded(const FormFields& fields);
+std::optional<std::string_view> find_form_value(const FormFields& fields,
+                                                std::string_view name) noexcept;
+std::vector<std::string_view> find_form_values(const FormFields& fields,
+                                               std::string_view name) noexcept;
+
 class Connection {
 public:
-    explicit Connection(io::ByteStream stream, Limits limits = {});
+    explicit Connection(io::ByteStream stream, Limits limits = {},
+                        IoTimeouts timeouts = {});
 
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
     Connection(Connection&&) noexcept = default;
     Connection& operator=(Connection&&) noexcept = default;
 
+    // Read and buffer the full request body into Request::body.
     Task<std::optional<Request>> read_request();
+    // Stream request body through on_chunk, leaving Request::body empty.
+    Task<std::optional<Request>> read_request_stream(BodySink on_chunk);
+    // Read and buffer the full response body into Response::body.
     Task<Response> read_response(std::string_view request_method = {});
+    // Stream response body through on_chunk, leaving Response::body empty.
+    Task<Response> read_response_stream(std::string_view request_method,
+                                        BodySink on_chunk);
+    // Write request with Request::body as fixed payload (or chunked when
+    // request.chunked=true).
     Task<void> write_request(const Request& request,
                              std::string_view default_host = {});
+    // Write request body from body_source as chunked transfer-encoding.
+    Task<void> write_request_stream(const Request& request,
+                                    BodyChunkSource body_source,
+                                    std::string_view default_host = {});
+    // Write response with Response::body as fixed payload (or chunked when
+    // response.chunked=true).
     Task<void> write_response(const Response& response,
                               std::string_view request_method = {});
+    // Write response body from body_source as chunked transfer-encoding when
+    // the status/method permits a response body.
+    Task<void> write_response_stream(const Response& response,
+                                     BodyChunkSource body_source,
+                                     std::string_view request_method = {});
 
     [[nodiscard]] bool is_open() const noexcept;
     io::ByteStream& stream() noexcept { return _stream; }
@@ -92,10 +153,16 @@ public:
     void close() noexcept;
 
 private:
+    Task<Response> read_response_stream_impl(std::string_view request_method,
+                                             BodySink on_chunk,
+                                             bool skip_informational);
+
     io::ByteStream _stream;
     Limits _limits;
+    IoTimeouts _timeouts;
     std::string _buffer;
     std::size_t _buffer_offset{0};
+    std::optional<Response> _prefetched_response;
 };
 
 struct ServerOptions {
@@ -103,6 +170,7 @@ struct ServerOptions {
     std::uint16_t port{0};
     int backlog{128};
     Limits limits{};
+    IoTimeouts timeouts{};
 };
 
 class Server {
@@ -130,6 +198,7 @@ private:
 struct ClientOptions {
     Limits limits{};
     bool keep_alive{true};
+    IoTimeouts timeouts{};
 };
 
 class Client {

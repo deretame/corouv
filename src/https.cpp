@@ -42,7 +42,8 @@ Task<void> Client::connect(std::string host, std::uint16_t port) {
 
     _host = std::move(host);
     _port = port;
-    _connection = std::make_unique<Connection>(std::move(stream), _options.limits);
+    _connection = std::make_unique<Connection>(std::move(stream), _options.limits,
+                                               _options.timeouts);
 }
 
 Task<Response> Client::request(Request request) {
@@ -91,7 +92,7 @@ Task<void> Server::handle_client(net::TcpStream stream) {
         std::move(stream), transport::make_bearssl_server_codec(_options.tls));
     co_await tls_stream.handshake_server();
 
-    Connection conn(std::move(tls_stream), _options.limits);
+    Connection conn(std::move(tls_stream), _options.limits, _options.timeouts);
 
     while (conn.is_open()) {
         Request request;

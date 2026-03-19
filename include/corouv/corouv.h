@@ -19,6 +19,8 @@
 #include "corouv/net.h"
 #include "corouv/poll.h"
 #include "corouv/runtime.h"
+#include "corouv/sql.h"
+#include "corouv/sql/orm.h"
 #include "corouv/sync_wait.h"
 #include "corouv/task.h"
 #include "corouv/task_group.h"

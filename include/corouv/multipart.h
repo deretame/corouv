@@ -25,9 +25,11 @@ std::optional<std::string> boundary_from_content_type(
     std::string_view content_type);
 
 FormData parse(std::string_view content_type, std::string_view body,
-               std::size_t max_parts = 256);
+               std::size_t max_parts = 256,
+               std::size_t max_part_bytes = 8 * 1024 * 1024);
 FormData parse_request(const corouv::http::Request& request,
-                       std::size_t max_parts = 256);
+                       std::size_t max_parts = 256,
+                       std::size_t max_part_bytes = 8 * 1024 * 1024);
 
 std::string build_content_type(std::string_view boundary);
 std::string serialize(const FormData& form, std::string_view boundary);

@@ -64,8 +64,14 @@ target_link_libraries(corouv_http_server PRIVATE corouv::corouv)
 add_executable(corouv_http_client http_client.cpp)
 target_link_libraries(corouv_http_client PRIVATE corouv::corouv)
 
+add_executable(corouv_http_form_multipart http_form_and_multipart.cpp)
+target_link_libraries(corouv_http_form_multipart PRIVATE corouv::corouv)
+
 add_executable(corouv_web_builder web_builder.cpp)
 target_link_libraries(corouv_web_builder PRIVATE corouv::corouv)
+
+add_executable(corouv_sql_basic sql_basic.cpp)
+target_link_libraries(corouv_sql_basic PRIVATE corouv::corouv)
 
 set(COROUV_LIBPQ_EXAMPLE_INCLUDE_DIR
   ${CMAKE_CURRENT_LIST_DIR}/../third_party/postgresql-install/include

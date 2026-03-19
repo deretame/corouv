@@ -43,6 +43,7 @@ add_library(corouv
   src/https.cpp
   src/multipart.cpp
   src/net.cpp
+  src/sql.cpp
   src/transport.cpp
   src/uv_executor.cpp
   ${BEARSSL_SOURCES}
@@ -58,6 +59,7 @@ target_include_directories(corouv PUBLIC
 target_link_libraries(corouv PUBLIC
   uv_a
   async_simple
+  ${CMAKE_DL_LIBS}
 )
 
 target_include_directories(corouv PRIVATE

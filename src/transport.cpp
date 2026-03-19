@@ -4,12 +4,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "corouv/timeout.h"
 
 namespace corouv::transport {
 
@@ -277,6 +280,11 @@ public:
         return (st & BR_SSL_SENDREC) != 0;
     }
 
+    bool plaintext_eof() const noexcept override {
+        const auto st = br_ssl_engine_current_state(engine_const());
+        return (st & BR_SSL_CLOSED) != 0;
+    }
+
     std::size_t write_plaintext(std::string_view data) override {
         ensure_ok();
         const auto st = br_ssl_engine_current_state(engine_const());
@@ -356,6 +364,12 @@ public:
         return copied;
     }
 
+    void start_close() override {
+        ensure_ok();
+        br_ssl_engine_close(engine());
+        ensure_ok();
+    }
+
 protected:
     BearSslCodecBase() = default;
 
@@ -401,6 +415,11 @@ public:
 
     void start_server() override {
         throw std::logic_error("client TLS codec cannot start as server");
+    }
+
+    std::optional<std::chrono::milliseconds> handshake_timeout() const
+        noexcept override {
+        return _config.handshake_timeout;
     }
 
 protected:
@@ -449,6 +468,11 @@ public:
         if (!br_ssl_server_reset(&_server)) {
             throw_tls_error("br_ssl_server_reset failed");
         }
+    }
+
+    std::optional<std::chrono::milliseconds> handshake_timeout() const
+        noexcept override {
+        return _config.handshake_timeout;
     }
 
 protected:
@@ -528,6 +552,74 @@ Task<void> CodecStream::handshake_client() { co_await run_handshake(true); }
 
 Task<void> CodecStream::handshake_server() { co_await run_handshake(false); }
 
+Task<void> CodecStream::close_notify() {
+    if (!is_open() || !_codec) {
+        co_return;
+    }
+
+    _codec->start_close();
+    co_await flush_ciphertext();
+    _stream.shutdown_write();
+}
+
+bool CodecStream::has_ciphertext_backlog() const noexcept {
+    return _ciphertext_backlog_offset < _ciphertext_backlog.size();
+}
+
+void CodecStream::compact_ciphertext_backlog() noexcept {
+    if (_ciphertext_backlog_offset == 0) {
+        return;
+    }
+    if (_ciphertext_backlog_offset >= _ciphertext_backlog.size()) {
+        _ciphertext_backlog.clear();
+        _ciphertext_backlog_offset = 0;
+        return;
+    }
+    _ciphertext_backlog.erase(0, _ciphertext_backlog_offset);
+    _ciphertext_backlog_offset = 0;
+}
+
+void CodecStream::feed_ciphertext_backlog() {
+    if (!_codec) {
+        return;
+    }
+
+    while (has_ciphertext_backlog()) {
+        const std::string_view pending(
+            _ciphertext_backlog.data() + _ciphertext_backlog_offset,
+            _ciphertext_backlog.size() - _ciphertext_backlog_offset);
+        const auto consumed = _codec->feed_ciphertext(pending);
+        if (consumed == 0) {
+            break;
+        }
+        _ciphertext_backlog_offset += consumed;
+    }
+    compact_ciphertext_backlog();
+}
+
+void CodecStream::feed_ciphertext_bytes(std::string_view data) {
+    if (!_codec || data.empty()) {
+        return;
+    }
+
+    if (has_ciphertext_backlog()) {
+        _ciphertext_backlog.append(data.data(), data.size());
+        feed_ciphertext_backlog();
+        return;
+    }
+
+    std::size_t offset = 0;
+    while (offset < data.size()) {
+        const auto consumed = _codec->feed_ciphertext(data.substr(offset));
+        if (consumed == 0) {
+            _ciphertext_backlog.assign(data.substr(offset));
+            _ciphertext_backlog_offset = 0;
+            return;
+        }
+        offset += consumed;
+    }
+}
+
 Task<void> CodecStream::run_handshake(bool client) {
     if (!_codec) {
         _codec = make_passthrough_codec();
@@ -539,9 +631,15 @@ Task<void> CodecStream::run_handshake(bool client) {
         _codec->start_server();
     }
 
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    if (const auto timeout = _codec->handshake_timeout(); timeout.has_value()) {
+        deadline = std::chrono::steady_clock::now() + *timeout;
+    }
+
     std::array<char, 4096> scratch{};
     while (!_codec->handshake_complete()) {
         co_await flush_ciphertext();
+        feed_ciphertext_backlog();
         if (_codec->handshake_complete()) {
             break;
         }
@@ -554,26 +652,40 @@ Task<void> CodecStream::run_handshake(bool client) {
             continue;
         }
 
-        const auto n = co_await _stream.read_some(
-            std::span<char>(scratch.data(), scratch.size()));
+        std::size_t n = 0;
+        if (!deadline.has_value()) {
+            n = co_await _stream.read_some(
+                std::span<char>(scratch.data(), scratch.size()));
+        } else {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= *deadline) {
+                throw std::runtime_error(
+                    "corouv::transport handshake timeout");
+            }
+            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                *deadline - now);
+            if (remaining <= std::chrono::milliseconds::zero()) {
+                remaining = std::chrono::milliseconds(1);
+            }
+            try {
+                n = co_await corouv::with_timeout(
+                    _stream.read_some(std::span<char>(scratch.data(), scratch.size())),
+                    remaining);
+            } catch (const corouv::TimeoutError&) {
+                throw std::runtime_error(
+                    "corouv::transport handshake timeout");
+            }
+        }
         if (n == 0) {
             throw std::runtime_error(
                 "corouv::transport handshake hit eof");
         }
 
-        std::size_t offset = 0;
-        while (offset < n) {
-            const auto consumed =
-                _codec->feed_ciphertext(std::string_view(scratch.data() + offset,
-                                                         n - offset));
-            if (consumed == 0) {
-                break;
-            }
-            offset += consumed;
-        }
+        feed_ciphertext_bytes(std::string_view(scratch.data(), n));
     }
 
     co_await flush_ciphertext();
+    feed_ciphertext_backlog();
 }
 
 Task<void> CodecStream::flush_ciphertext() {
@@ -600,15 +712,28 @@ Task<std::size_t> CodecStream::read_some(std::span<char> buffer) {
         co_return 0;
     }
 
+    feed_ciphertext_backlog();
     if (const auto ready = _codec->read_plaintext(buffer); ready > 0) {
         co_return ready;
+    }
+    if (_codec->plaintext_eof()) {
+        co_return 0;
     }
 
     std::array<char, 4096> scratch{};
     while (true) {
         co_await flush_ciphertext();
+        feed_ciphertext_backlog();
         if (const auto ready = _codec->read_plaintext(buffer); ready > 0) {
             co_return ready;
+        }
+        if (_codec->plaintext_eof()) {
+            co_return 0;
+        }
+
+        if (has_ciphertext_backlog()) {
+            throw std::runtime_error(
+                "corouv::transport::CodecStream ciphertext backlog stalled");
         }
 
         const auto n = co_await _stream.read_some(
@@ -617,19 +742,13 @@ Task<std::size_t> CodecStream::read_some(std::span<char> buffer) {
             co_return 0;
         }
 
-        std::size_t offset = 0;
-        while (offset < n) {
-            const auto consumed =
-                _codec->feed_ciphertext(std::string_view(scratch.data() + offset,
-                                                         n - offset));
-            if (consumed == 0) {
-                break;
-            }
-            offset += consumed;
-        }
+        feed_ciphertext_bytes(std::string_view(scratch.data(), n));
 
         if (const auto ready = _codec->read_plaintext(buffer); ready > 0) {
             co_return ready;
+        }
+        if (_codec->plaintext_eof()) {
+            co_return 0;
         }
     }
 }
@@ -646,14 +765,32 @@ Task<void> CodecStream::write_all(std::string_view data) {
     std::size_t offset = 0;
     std::array<char, 4096> scratch{};
     while (offset < data.size()) {
+        feed_ciphertext_backlog();
         const auto consumed = _codec->write_plaintext(data.substr(offset));
         if (consumed > 0) {
             offset += consumed;
         }
 
         co_await flush_ciphertext();
+        feed_ciphertext_backlog();
         if (offset >= data.size()) {
             break;
+        }
+
+        if (_codec->plaintext_eof()) {
+            throw std::runtime_error(
+                "corouv::transport::CodecStream write on closed TLS session");
+        }
+        if (!_codec->wants_input()) {
+            if (_codec->has_pending_ciphertext()) {
+                continue;
+            }
+            throw std::runtime_error(
+                "corouv::transport::CodecStream write stalled");
+        }
+        if (has_ciphertext_backlog()) {
+            throw std::runtime_error(
+                "corouv::transport::CodecStream write backlog stalled");
         }
 
         const auto n = co_await _stream.read_some(
@@ -662,16 +799,7 @@ Task<void> CodecStream::write_all(std::string_view data) {
             throw std::runtime_error(
                 "corouv::transport::CodecStream write hit eof");
         }
-
-        std::size_t feed_offset = 0;
-        while (feed_offset < n) {
-            const auto feed = _codec->feed_ciphertext(
-                std::string_view(scratch.data() + feed_offset, n - feed_offset));
-            if (feed == 0) {
-                break;
-            }
-            feed_offset += feed;
-        }
+        feed_ciphertext_bytes(std::string_view(scratch.data(), n));
     }
 
     co_await flush_ciphertext();

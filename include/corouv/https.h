@@ -20,11 +20,13 @@ using Request = corouv::http::Request;
 using Response = corouv::http::Response;
 using Url = corouv::http::Url;
 using Connection = corouv::http::Connection;
+using IoTimeouts = corouv::http::IoTimeouts;
 
 struct ClientOptions {
     Limits limits{};
     transport::TlsClientConfig tls;
     bool keep_alive{true};
+    IoTimeouts timeouts{};
 };
 
 class Client {
@@ -54,6 +56,7 @@ struct ServerOptions {
     int backlog{128};
     Limits limits{};
     transport::TlsServerConfig tls;
+    IoTimeouts timeouts{};
 };
 
 class Server {

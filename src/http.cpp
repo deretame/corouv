@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "corouv/task_group.h"
+#include "corouv/timeout.h"
 #include "picohttpparser.h"
 
 namespace corouv::http {
@@ -129,8 +130,56 @@ std::optional<std::size_t> parse_content_length(const Headers& headers) {
     return parsed;
 }
 
-bool message_is_chunked(const Headers& headers) {
-    return header_contains_token(headers, "Transfer-Encoding", "chunked");
+enum class ParsedTransferEncoding {
+    None,
+    Chunked,
+};
+
+ParsedTransferEncoding parse_transfer_encoding(const Headers& headers) {
+    bool saw_transfer_encoding = false;
+    bool saw_chunked = false;
+
+    for (const auto& header : headers) {
+        if (!iequals(header.name, "Transfer-Encoding")) {
+            continue;
+        }
+
+        std::string_view remaining = header.value;
+        while (!remaining.empty()) {
+            const auto comma = remaining.find(',');
+            const auto part =
+                remaining.substr(0, comma == std::string_view::npos
+                                        ? remaining.size()
+                                        : comma);
+            const auto token = trim_copy(part);
+            if (!token.empty()) {
+                saw_transfer_encoding = true;
+                if (iequals(token, "chunked")) {
+                    if (saw_chunked) {
+                        throw std::invalid_argument(
+                            "invalid HTTP message: duplicate chunked Transfer-Encoding");
+                    }
+                    saw_chunked = true;
+                } else {
+                    throw std::invalid_argument(
+                        "unsupported Transfer-Encoding");
+                }
+            }
+
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            remaining.remove_prefix(comma + 1);
+        }
+    }
+
+    if (!saw_transfer_encoding) {
+        return ParsedTransferEncoding::None;
+    }
+    if (!saw_chunked) {
+        throw std::invalid_argument("unsupported Transfer-Encoding");
+    }
+    return ParsedTransferEncoding::Chunked;
 }
 
 bool should_keep_alive(const Headers& headers, int version_minor) {
@@ -141,6 +190,57 @@ bool should_keep_alive(const Headers& headers, int version_minor) {
         return true;
     }
     return version_minor >= 1;
+}
+
+enum class ParsedExpect {
+    None,
+    Continue100,
+    Unsupported,
+};
+
+ParsedExpect parse_expect(const Headers& headers) {
+    bool saw_continue = false;
+    bool saw_other = false;
+
+    for (const auto& header : headers) {
+        if (!iequals(header.name, "Expect")) {
+            continue;
+        }
+
+        std::string_view remaining = header.value;
+        while (!remaining.empty()) {
+            const auto comma = remaining.find(',');
+            const auto part =
+                remaining.substr(0, comma == std::string_view::npos
+                                        ? remaining.size()
+                                        : comma);
+            const auto token = trim_copy(part);
+            if (!token.empty()) {
+                if (iequals(token, "100-continue")) {
+                    saw_continue = true;
+                } else {
+                    saw_other = true;
+                }
+            }
+
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            remaining.remove_prefix(comma + 1);
+        }
+    }
+
+    if (saw_other) {
+        return ParsedExpect::Unsupported;
+    }
+    if (saw_continue) {
+        return ParsedExpect::Continue100;
+    }
+    return ParsedExpect::None;
+}
+
+bool expects_continue(const Headers& headers) {
+    return parse_expect(headers) == ParsedExpect::Continue100;
 }
 
 bool response_has_body(int status, std::string_view request_method) {
@@ -176,12 +276,52 @@ Headers copy_headers(const phr_header* raw, std::size_t count) {
     return headers;
 }
 
+template <class T>
+Task<T> with_optional_timeout(Task<T> task,
+                              const std::optional<std::chrono::milliseconds>& dur,
+                              int status, const char* message) {
+    if (!dur.has_value()) {
+        co_return co_await std::move(task);
+    }
+
+    try {
+        co_return co_await corouv::with_timeout(std::move(task), *dur);
+    } catch (const corouv::TimeoutError&) {
+        throw Error(status, message);
+    }
+}
+
+Task<void> with_optional_timeout(Task<void> task,
+                                 const std::optional<std::chrono::milliseconds>& dur,
+                                 int status, const char* message) {
+    if (!dur.has_value()) {
+        co_await std::move(task);
+        co_return;
+    }
+
+    try {
+        co_await corouv::with_timeout(std::move(task), *dur);
+    } catch (const corouv::TimeoutError&) {
+        throw Error(status, message);
+    }
+}
+
 Task<std::size_t> read_more(io::ByteStream& stream, BufferCursor& buffer,
                             std::size_t max_buffered, int error_status,
-                            const char* message) {
+                            const char* message, std::size_t max_read = 4096,
+                            const std::optional<std::chrono::milliseconds>& timeout =
+                                std::nullopt,
+                            int timeout_status = 408,
+                            const char* timeout_message = "http read timeout") {
+    if (max_read == 0) {
+        co_return 0;
+    }
+
     std::array<char, 4096> scratch{};
-    const auto n = co_await stream.recv_some(
-        std::span<char>(scratch.data(), scratch.size()));
+    const auto read_cap = std::min(max_read, scratch.size());
+    const auto n = co_await with_optional_timeout(
+        stream.recv_some(std::span<char>(scratch.data(), read_cap)), timeout,
+        timeout_status, timeout_message);
     if (n == 0) {
         co_return 0;
     }
@@ -195,10 +335,14 @@ Task<std::size_t> read_more(io::ByteStream& stream, BufferCursor& buffer,
 Task<void> ensure_buffer(io::ByteStream& stream, BufferCursor& buffer,
                          std::size_t wanted, std::size_t max_buffered,
                          int error_status, const char* message,
-                         const char* eof_message) {
+                         const char* eof_message,
+                         const std::optional<std::chrono::milliseconds>& timeout,
+                         int timeout_status, const char* timeout_message) {
     while (buffer.size() < wanted) {
-        const auto n =
-            co_await read_more(stream, buffer, max_buffered, error_status, message);
+        const auto need = wanted - buffer.size();
+        const auto n = co_await read_more(stream, buffer, max_buffered,
+                                          error_status, message, need, timeout,
+                                          timeout_status, timeout_message);
         if (n == 0) {
             throw Error(400, eof_message);
         }
@@ -209,7 +353,10 @@ Task<void> ensure_buffer(io::ByteStream& stream, BufferCursor& buffer,
 Task<std::string> read_line_crlf(io::ByteStream& stream, BufferCursor& buffer,
                                  std::size_t max_line, int error_status,
                                  const char* too_large_message,
-                                 const char* eof_message) {
+                                 const char* eof_message,
+                                 const std::optional<std::chrono::milliseconds>& timeout,
+                                 int timeout_status,
+                                 const char* timeout_message) {
     for (;;) {
         const auto pos = buffer.find("\r\n");
         if (pos != std::string_view::npos) {
@@ -224,33 +371,78 @@ Task<std::string> read_line_crlf(io::ByteStream& stream, BufferCursor& buffer,
 
         const auto n =
             co_await read_more(stream, buffer, max_line, error_status,
-                               too_large_message);
+                               too_large_message, max_line - buffer.size(),
+                               timeout, timeout_status, timeout_message);
         if (n == 0) {
             throw Error(400, eof_message);
         }
     }
 }
 
-Task<std::string> read_fixed_body(io::ByteStream& stream, BufferCursor& buffer,
-                                  const Limits& limits, std::size_t size) {
+Task<void> read_fixed_body_stream(io::ByteStream& stream, BufferCursor& buffer,
+                                  const Limits& limits, std::size_t size,
+                                  const BodySink& on_chunk,
+                                  const std::optional<std::chrono::milliseconds>& timeout,
+                                  int timeout_status,
+                                  const char* timeout_message) {
     if (size > limits.max_body_bytes) {
         throw Error(413, "HTTP body too large");
     }
 
-    co_await ensure_buffer(stream, buffer, size, size, 413, "HTTP body too large",
-                           "unexpected eof while reading HTTP body");
-    co_return buffer.take(size);
+    std::size_t remaining = size;
+    while (remaining > 0) {
+        if (!buffer.empty()) {
+            const auto n = std::min(remaining, buffer.size());
+            co_await on_chunk(buffer.view().substr(0, n));
+            buffer.consume(n);
+            remaining -= n;
+            continue;
+        }
+
+        const auto n = co_await read_more(
+            stream, buffer, remaining, 413, "HTTP body too large",
+            std::min<std::size_t>(remaining, 4096), timeout, timeout_status,
+            timeout_message);
+        if (n == 0) {
+            throw Error(400, "unexpected eof while reading HTTP body");
+        }
+    }
+
+    co_return;
 }
 
-Task<std::string> read_chunked_body(io::ByteStream& stream, BufferCursor& buffer,
-                                    const Limits& limits) {
-    std::string body;
+Task<void> read_chunked_body_stream(io::ByteStream& stream, BufferCursor& buffer,
+                                    const Limits& limits, const BodySink& on_chunk,
+                                    const std::optional<std::chrono::milliseconds>& timeout,
+                                    int timeout_status, const char* timeout_message,
+                                    Headers* trailers_out = nullptr) {
+    auto append_trailer = [trailers_out](std::string_view line) {
+        if (trailers_out == nullptr) {
+            return;
+        }
 
+        const auto colon = line.find(':');
+        if (colon == std::string_view::npos) {
+            throw Error(400, "invalid chunk trailer header");
+        }
+
+        trailers_out->push_back(Header{
+            trim_copy(line.substr(0, colon)),
+            trim_copy(line.substr(colon + 1)),
+        });
+    };
+
+    if (trailers_out != nullptr) {
+        trailers_out->clear();
+    }
+
+    std::size_t total = 0;
     for (;;) {
         const auto line =
             co_await read_line_crlf(stream, buffer, limits.max_header_bytes, 431,
                                     "chunk header too large",
-                                    "unexpected eof while reading chunk header");
+                                    "unexpected eof while reading chunk header",
+                                    timeout, timeout_status, timeout_message);
 
         const auto semi = line.find(';');
         const auto chunk_size_text =
@@ -271,26 +463,34 @@ Task<std::string> read_chunked_body(io::ByteStream& stream, BufferCursor& buffer
                 const auto trailer = co_await read_line_crlf(
                     stream, buffer, limits.max_header_bytes, 431,
                     "trailer headers too large",
-                    "unexpected eof while reading trailer headers");
+                    "unexpected eof while reading trailer headers", timeout,
+                    timeout_status, timeout_message);
                 if (trailer.empty()) {
-                    co_return body;
+                    co_return;
+                }
+                append_trailer(trailer);
+                if (trailers_out != nullptr &&
+                    trailers_out->size() > limits.max_header_count) {
+                    throw Error(431, "too many chunk trailer headers");
                 }
             }
         }
 
-        if (body.size() + chunk_size > limits.max_body_bytes) {
+        if (total + chunk_size > limits.max_body_bytes) {
             throw Error(413, "HTTP body too large");
         }
 
         const std::size_t max_buffered =
-            std::min(limits.max_body_bytes - body.size() + 2,
+            std::min(limits.max_body_bytes - total + 2,
                      limits.max_body_bytes + limits.max_header_bytes);
         co_await ensure_buffer(stream, buffer, chunk_size + 2, max_buffered, 413,
                                "HTTP body too large",
-                               "unexpected eof while reading chunk data");
+                               "unexpected eof while reading chunk data", timeout,
+                               timeout_status, timeout_message);
 
-        body.append(buffer.view().data(), chunk_size);
+        co_await on_chunk(buffer.view().substr(0, chunk_size));
         buffer.consume(chunk_size);
+        total += chunk_size;
 
         const auto tail = buffer.view();
         if (tail.size() < 2 || tail[0] != '\r' || tail[1] != '\n') {
@@ -300,27 +500,37 @@ Task<std::string> read_chunked_body(io::ByteStream& stream, BufferCursor& buffer
     }
 }
 
-Task<std::string> read_until_close_body(io::ByteStream& stream,
-                                        BufferCursor& buffer,
-                                        const Limits& limits) {
-    std::string body(buffer.view());
-    buffer.consume(buffer.size());
+Task<void> read_until_close_body_stream(
+    io::ByteStream& stream, BufferCursor& buffer, const Limits& limits,
+    const BodySink& on_chunk,
+    const std::optional<std::chrono::milliseconds>& timeout, int timeout_status,
+    const char* timeout_message) {
+    std::size_t total = buffer.size();
+    if (total > limits.max_body_bytes) {
+        throw Error(413, "HTTP body too large");
+    }
+    if (!buffer.empty()) {
+        co_await on_chunk(buffer.view());
+        buffer.consume(buffer.size());
+    }
 
     std::array<char, 4096> scratch{};
     while (true) {
-        const auto n = co_await stream.recv_some(
-            std::span<char>(scratch.data(), scratch.size()));
+        const auto n = co_await with_optional_timeout(
+            stream.recv_some(std::span<char>(scratch.data(), scratch.size())),
+            timeout, timeout_status, timeout_message);
         if (n == 0) {
             stream.close();
             break;
         }
-        if (body.size() + n > limits.max_body_bytes) {
+        if (total + n > limits.max_body_bytes) {
             throw Error(413, "HTTP body too large");
         }
-        body.append(scratch.data(), n);
+        total += n;
+        co_await on_chunk(std::string_view(scratch.data(), n));
     }
 
-    co_return body;
+    co_return;
 }
 
 std::string format_host_header(std::string_view host, std::uint16_t port) {
@@ -330,6 +540,8 @@ std::string format_host_header(std::string_view host, std::uint16_t port) {
     }
     return net::to_string(net::Endpoint{std::string(host), port});
 }
+
+std::string serialize_headers(const Headers& headers);
 
 void prepare_outgoing_headers(Headers& headers, bool keep_alive, bool chunked,
                               std::size_t body_size) {
@@ -346,19 +558,47 @@ void prepare_outgoing_headers(Headers& headers, bool keep_alive, bool chunked,
     }
 }
 
-Task<void> write_chunked_body(io::ByteStream& stream, std::string_view body) {
-    if (body.empty()) {
-        co_await stream.send_all(std::string_view("0\r\n\r\n"));
-        co_return;
-    }
-
+Task<void> write_chunk(io::ByteStream& stream, std::string_view chunk,
+                       const std::optional<std::chrono::milliseconds>& timeout,
+                       int timeout_status, const char* timeout_message) {
     char chunk_header[64] = {0};
     const int n = std::snprintf(chunk_header, sizeof(chunk_header), "%zx\r\n",
-                                static_cast<std::size_t>(body.size()));
-    co_await stream.send_all(
-        std::string_view(chunk_header, static_cast<std::size_t>(n)));
-    co_await stream.send_all(body);
-    co_await stream.send_all(std::string_view("\r\n0\r\n\r\n"));
+                                static_cast<std::size_t>(chunk.size()));
+    co_await with_optional_timeout(
+        stream.send_all(
+            std::string_view(chunk_header, static_cast<std::size_t>(n))),
+        timeout, timeout_status, timeout_message);
+    if (!chunk.empty()) {
+        co_await with_optional_timeout(stream.send_all(chunk), timeout,
+                                       timeout_status, timeout_message);
+    }
+    co_await with_optional_timeout(stream.send_all(std::string_view("\r\n")),
+                                   timeout, timeout_status, timeout_message);
+}
+
+Task<void> write_chunked_body_stream(
+    io::ByteStream& stream, BodyChunkSource body_source,
+    const Headers& trailers,
+    const std::optional<std::chrono::milliseconds>& timeout,
+    int timeout_status, const char* timeout_message) {
+    for (;;) {
+        auto next = co_await body_source();
+        if (!next.has_value()) {
+            break;
+        }
+        co_await write_chunk(stream, *next, timeout, timeout_status,
+                             timeout_message);
+    }
+
+    co_await with_optional_timeout(stream.send_all(std::string_view("0\r\n")),
+                                   timeout, timeout_status, timeout_message);
+    if (!trailers.empty()) {
+        const auto trailer_block = serialize_headers(trailers);
+        co_await with_optional_timeout(stream.send_all(std::string_view(trailer_block)),
+                                       timeout, timeout_status, timeout_message);
+    }
+    co_await with_optional_timeout(stream.send_all(std::string_view("\r\n")),
+                                   timeout, timeout_status, timeout_message);
 }
 
 std::string serialize_headers(const Headers& headers) {
@@ -410,6 +650,176 @@ bool header_contains_token(const Headers& headers, std::string_view name,
     return false;
 }
 
+bool is_form_urlencoded_content_type(std::string_view content_type) {
+    const auto semi = content_type.find(';');
+    const auto mime = content_type.substr(
+        0, semi == std::string_view::npos ? content_type.size() : semi);
+    return iequals(trim_copy(mime), "application/x-www-form-urlencoded");
+}
+
+std::string form_urlencode(std::string_view value) {
+    constexpr char hex[] = "0123456789ABCDEF";
+
+    std::string out;
+    out.reserve(value.size() * 3);
+
+    for (const unsigned char ch : value) {
+        if (std::isalnum(ch) != 0 || ch == '-' || ch == '_' || ch == '.' ||
+            ch == '*') {
+            out.push_back(static_cast<char>(ch));
+            continue;
+        }
+
+        if (ch == ' ') {
+            out.push_back('+');
+            continue;
+        }
+
+        out.push_back('%');
+        out.push_back(hex[ch >> 4]);
+        out.push_back(hex[ch & 0x0f]);
+    }
+
+    return out;
+}
+
+std::string form_urldecode(std::string_view value) {
+    auto hex_value = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') {
+            return ch - '0';
+        }
+        if (ch >= 'a' && ch <= 'f') {
+            return 10 + (ch - 'a');
+        }
+        if (ch >= 'A' && ch <= 'F') {
+            return 10 + (ch - 'A');
+        }
+        return -1;
+    };
+
+    std::string out;
+    out.reserve(value.size());
+
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const char ch = value[i];
+        if (ch == '+') {
+            out.push_back(' ');
+            continue;
+        }
+        if (ch != '%') {
+            out.push_back(ch);
+            continue;
+        }
+
+        if (i + 2 >= value.size()) {
+            throw std::invalid_argument(
+                "corouv::http invalid percent-encoding in form value");
+        }
+
+        const int hi = hex_value(value[i + 1]);
+        const int lo = hex_value(value[i + 2]);
+        if (hi < 0 || lo < 0) {
+            throw std::invalid_argument(
+                "corouv::http invalid percent-encoding in form value");
+        }
+
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+    }
+
+    return out;
+}
+
+FormFields parse_form_urlencoded(std::string_view body, std::size_t max_fields) {
+    FormFields fields;
+
+    std::size_t start = 0;
+    while (start <= body.size()) {
+        const auto amp = body.find('&', start);
+        const auto token = body.substr(
+            start, amp == std::string_view::npos ? body.size() - start
+                                                 : amp - start);
+
+        if (!token.empty()) {
+            const auto eq = token.find('=');
+            const auto encoded_name = token.substr(
+                0, eq == std::string_view::npos ? token.size() : eq);
+            const auto encoded_value = eq == std::string_view::npos
+                                           ? std::string_view{}
+                                           : token.substr(eq + 1);
+
+            fields.push_back(FormField{
+                .name = form_urldecode(encoded_name),
+                .value = form_urldecode(encoded_value),
+            });
+
+            if (fields.size() > max_fields) {
+                throw std::runtime_error("corouv::http too many form fields");
+            }
+        }
+
+        if (amp == std::string_view::npos) {
+            break;
+        }
+        start = amp + 1;
+    }
+
+    return fields;
+}
+
+FormFields parse_form_urlencoded_request(const Request& request,
+                                         std::size_t max_fields) {
+    const auto content_type = find_header(request.headers, "Content-Type");
+    if (!content_type.has_value()) {
+        throw std::runtime_error(
+            "corouv::http request missing Content-Type header");
+    }
+    if (!is_form_urlencoded_content_type(*content_type)) {
+        throw std::runtime_error(
+            "corouv::http request Content-Type is not application/x-www-form-urlencoded");
+    }
+
+    return parse_form_urlencoded(request.body, max_fields);
+}
+
+std::string serialize_form_urlencoded(const FormFields& fields) {
+    std::string out;
+
+    bool first = true;
+    for (const auto& field : fields) {
+        if (!first) {
+            out.push_back('&');
+        }
+        first = false;
+        out.append(form_urlencode(field.name));
+        out.push_back('=');
+        out.append(form_urlencode(field.value));
+    }
+
+    return out;
+}
+
+std::optional<std::string_view> find_form_value(
+    const FormFields& fields, std::string_view name) noexcept {
+    for (const auto& field : fields) {
+        if (field.name == name) {
+            return field.value;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<std::string_view> find_form_values(const FormFields& fields,
+                                               std::string_view name) noexcept {
+    std::vector<std::string_view> out;
+    for (const auto& field : fields) {
+        if (field.name == name) {
+            out.push_back(field.value);
+        }
+    }
+    return out;
+}
+
 void append_header(Headers& headers, std::string name, std::string value) {
     headers.push_back(Header{std::move(name), std::move(value)});
 }
@@ -431,6 +841,8 @@ std::string reason_phrase(int status) {
             return "Continue";
         case 101:
             return "Switching Protocols";
+        case 103:
+            return "Early Hints";
         case 200:
             return "OK";
         case 201:
@@ -467,6 +879,8 @@ std::string reason_phrase(int status) {
             return "URI Too Long";
         case 415:
             return "Unsupported Media Type";
+        case 417:
+            return "Expectation Failed";
         case 418:
             return "I'm a teapot";
         case 422:
@@ -492,14 +906,30 @@ std::string reason_phrase(int status) {
     }
 }
 
-Connection::Connection(io::ByteStream stream, Limits limits)
-    : _stream(std::move(stream)), _limits(limits) {}
+Connection::Connection(io::ByteStream stream, Limits limits, IoTimeouts timeouts)
+    : _stream(std::move(stream)),
+      _limits(limits),
+      _timeouts(std::move(timeouts)) {}
 
 bool Connection::is_open() const noexcept { return _stream.is_open(); }
 
 void Connection::close() noexcept { _stream.close(); }
 
 Task<std::optional<Request>> Connection::read_request() {
+    std::string body;
+    const BodySink sink = [&body](std::string_view chunk) -> Task<void> {
+        body.append(chunk);
+        co_return;
+    };
+
+    auto request = co_await read_request_stream(sink);
+    if (request.has_value()) {
+        request->body = std::move(body);
+    }
+    co_return request;
+}
+
+Task<std::optional<Request>> Connection::read_request_stream(BodySink on_chunk) {
     BufferCursor buffer(_buffer, _buffer_offset);
     std::size_t last_len = 0;
 
@@ -525,18 +955,43 @@ Task<std::optional<Request>> Connection::read_request() {
                 request.headers = copy_headers(raw.data(), num_headers);
                 request.keep_alive =
                     should_keep_alive(request.headers, request.version_minor);
-                request.chunked = message_is_chunked(request.headers);
+                try {
+                    request.chunked =
+                        parse_transfer_encoding(request.headers) ==
+                        ParsedTransferEncoding::Chunked;
+                } catch (const std::invalid_argument& e) {
+                    throw Error(400, e.what());
+                }
+                const auto content_length = parse_content_length(request.headers);
+                if (request.chunked && content_length.has_value()) {
+                    throw Error(
+                        400,
+                        "invalid HTTP request: both Transfer-Encoding and Content-Length");
+                }
 
                 buffer.consume(static_cast<std::size_t>(parsed));
 
+                const bool has_request_body =
+                    request.chunked ||
+                    (content_length.has_value() && *content_length > 0);
+                const auto expect = parse_expect(request.headers);
+                if (expect == ParsedExpect::Unsupported) {
+                    throw Error(417, "unsupported Expect header");
+                }
+                if (expect == ParsedExpect::Continue100 && has_request_body) {
+                    co_await with_optional_timeout(
+                        _stream.send_all(std::string_view("HTTP/1.1 100 Continue\r\n\r\n")),
+                        _timeouts.write, 504, "continue write timeout");
+                }
+
                 if (request.chunked) {
-                    request.body =
-                        co_await read_chunked_body(_stream, buffer, _limits);
-                } else if (const auto len =
-                               parse_content_length(request.headers);
-                           len.has_value()) {
-                    request.body =
-                        co_await read_fixed_body(_stream, buffer, _limits, *len);
+                    co_await read_chunked_body_stream(
+                        _stream, buffer, _limits, on_chunk, _timeouts.read_body,
+                        408, "request body read timeout", &request.trailers);
+                } else if (content_length.has_value()) {
+                    co_await read_fixed_body_stream(
+                        _stream, buffer, _limits, *content_length, on_chunk,
+                        _timeouts.read_body, 408, "request body read timeout");
                 }
 
                 co_return request;
@@ -552,8 +1007,10 @@ Task<std::optional<Request>> Connection::read_request() {
         }
 
         last_len = buffer.size();
-        const auto n = co_await read_more(_stream, buffer, _limits.max_header_bytes,
-                                          431, "request headers too large");
+        const auto n = co_await read_more(
+            _stream, buffer, _limits.max_header_bytes, 431,
+            "request headers too large", _limits.max_header_bytes - buffer.size(),
+            _timeouts.read_headers, 408, "request header read timeout");
         if (n == 0) {
             if (buffer.empty()) {
                 co_return std::nullopt;
@@ -564,6 +1021,41 @@ Task<std::optional<Request>> Connection::read_request() {
 }
 
 Task<Response> Connection::read_response(std::string_view request_method) {
+    if (_prefetched_response.has_value()) {
+        auto response = std::move(*_prefetched_response);
+        _prefetched_response.reset();
+        co_return response;
+    }
+
+    std::string body;
+    const BodySink sink = [&body](std::string_view chunk) -> Task<void> {
+        body.append(chunk);
+        co_return;
+    };
+
+    auto response =
+        co_await read_response_stream_impl(request_method, sink, true);
+    response.body = std::move(body);
+    co_return response;
+}
+
+Task<Response> Connection::read_response_stream(std::string_view request_method,
+                                                BodySink on_chunk) {
+    if (_prefetched_response.has_value()) {
+        auto response = std::move(*_prefetched_response);
+        _prefetched_response.reset();
+        if (!response.body.empty()) {
+            co_await on_chunk(response.body);
+            response.body.clear();
+        }
+        co_return response;
+    }
+
+    co_return co_await read_response_stream_impl(request_method, on_chunk, true);
+}
+
+Task<Response> Connection::read_response_stream_impl(
+    std::string_view request_method, BodySink on_chunk, bool skip_informational) {
     BufferCursor buffer(_buffer, _buffer_offset);
     std::size_t last_len = 0;
 
@@ -588,22 +1080,63 @@ Task<Response> Connection::read_response(std::string_view request_method) {
                 response.headers = copy_headers(raw.data(), num_headers);
                 response.keep_alive =
                     should_keep_alive(response.headers, response.version_minor);
-                response.chunked = message_is_chunked(response.headers);
+                try {
+                    response.chunked =
+                        parse_transfer_encoding(response.headers) ==
+                        ParsedTransferEncoding::Chunked;
+                } catch (const std::invalid_argument& e) {
+                    throw Error(502, e.what());
+                }
+                std::optional<std::size_t> content_length;
+                try {
+                    content_length = parse_content_length(response.headers);
+                } catch (const Error&) {
+                    throw Error(502, "invalid response Content-Length");
+                }
+                if (response.chunked && content_length.has_value()) {
+                    throw Error(
+                        502,
+                        "invalid HTTP response: both Transfer-Encoding and Content-Length");
+                }
 
                 buffer.consume(static_cast<std::size_t>(parsed));
 
+                if (response.status >= 100 && response.status < 200 &&
+                    response.status != 101) {
+                    const BodySink ignore = [](std::string_view) -> Task<void> {
+                        co_return;
+                    };
+                    if (response.chunked) {
+                        co_await read_chunked_body_stream(
+                            _stream, buffer, _limits, ignore, _timeouts.read_body,
+                            504, "response body read timeout");
+                    } else if (content_length.has_value()) {
+                        co_await read_fixed_body_stream(
+                            _stream, buffer, _limits, *content_length, ignore,
+                            _timeouts.read_body, 504,
+                            "response body read timeout");
+                    }
+                    if (skip_informational) {
+                        last_len = 0;
+                        continue;
+                    }
+                    co_return response;
+                }
+
                 if (response_has_body(response.status, request_method)) {
                     if (response.chunked) {
-                        response.body =
-                            co_await read_chunked_body(_stream, buffer, _limits);
-                    } else if (const auto len =
-                                   parse_content_length(response.headers);
-                               len.has_value()) {
-                        response.body = co_await read_fixed_body(_stream, buffer,
-                                                                 _limits, *len);
+                        co_await read_chunked_body_stream(
+                            _stream, buffer, _limits, on_chunk, _timeouts.read_body,
+                            504, "response body read timeout", &response.trailers);
+                    } else if (content_length.has_value()) {
+                        co_await read_fixed_body_stream(
+                            _stream, buffer, _limits, *content_length, on_chunk,
+                            _timeouts.read_body, 504, "response body read timeout");
                     } else if (!response.keep_alive) {
-                        response.body = co_await read_until_close_body(
-                            _stream, buffer, _limits);
+                        co_await read_until_close_body_stream(
+                            _stream, buffer, _limits, on_chunk,
+                            _timeouts.read_body, 504,
+                            "response body read timeout");
                     }
                 }
 
@@ -620,8 +1153,10 @@ Task<Response> Connection::read_response(std::string_view request_method) {
         }
 
         last_len = buffer.size();
-        const auto n = co_await read_more(_stream, buffer, _limits.max_header_bytes,
-                                          502, "response headers too large");
+        const auto n = co_await read_more(
+            _stream, buffer, _limits.max_header_bytes, 502,
+            "response headers too large", _limits.max_header_bytes - buffer.size(),
+            _timeouts.read_headers, 504, "response header read timeout");
         if (n == 0) {
             throw Error(502, "unexpected eof while reading response");
         }
@@ -630,6 +1165,20 @@ Task<Response> Connection::read_response(std::string_view request_method) {
 
 Task<void> Connection::write_request(const Request& request,
                                      std::string_view default_host) {
+    if (request.chunked) {
+        BodyChunkSource source =
+            [payload = request.body, sent = false]() mutable
+                -> Task<std::optional<std::string>> {
+            if (sent) {
+                co_return std::nullopt;
+            }
+            sent = true;
+            co_return std::move(payload);
+        };
+        co_await write_request_stream(request, std::move(source), default_host);
+        co_return;
+    }
+
     Request outgoing = request;
     if (outgoing.target.empty()) {
         outgoing.target = "/";
@@ -644,6 +1193,7 @@ Task<void> Connection::write_request(const Request& request,
 
     prepare_outgoing_headers(outgoing.headers, outgoing.keep_alive,
                              outgoing.chunked, outgoing.body.size());
+    const bool expect_100 = expects_continue(outgoing.headers);
 
     std::string head;
     head.reserve(128 + outgoing.body.size());
@@ -656,17 +1206,49 @@ Task<void> Connection::write_request(const Request& request,
     head.append(serialize_headers(outgoing.headers));
     head.append("\r\n");
 
-    co_await _stream.send_all(std::string_view(head));
+    co_await with_optional_timeout(_stream.send_all(std::string_view(head)),
+                                   _timeouts.write, 504, "request write timeout");
 
-    if (outgoing.chunked) {
-        co_await write_chunked_body(_stream, outgoing.body);
-    } else if (!outgoing.body.empty()) {
-        co_await _stream.send_all(std::string_view(outgoing.body));
+    if (expect_100 && !outgoing.body.empty()) {
+        std::string prefetched_body;
+        const BodySink sink =
+            [&prefetched_body](std::string_view chunk) -> Task<void> {
+            prefetched_body.append(chunk);
+            co_return;
+        };
+
+        auto prefetched =
+            co_await read_response_stream_impl(outgoing.method, sink, false);
+        prefetched.body = std::move(prefetched_body);
+        if (prefetched.status != 100) {
+            _prefetched_response = std::move(prefetched);
+            co_return;
+        }
+    }
+
+    if (!outgoing.body.empty()) {
+        co_await with_optional_timeout(_stream.send_all(std::string_view(outgoing.body)),
+                                       _timeouts.write, 504,
+                                       "request write timeout");
     }
 }
 
 Task<void> Connection::write_response(const Response& response,
                                       std::string_view request_method) {
+    if (response.chunked) {
+        BodyChunkSource source =
+            [payload = response.body, sent = false]() mutable
+                -> Task<std::optional<std::string>> {
+            if (sent) {
+                co_return std::nullopt;
+            }
+            sent = true;
+            co_return std::move(payload);
+        };
+        co_await write_response_stream(response, std::move(source), request_method);
+        co_return;
+    }
+
     Response outgoing = response;
     if (outgoing.reason.empty()) {
         outgoing.reason = reason_phrase(outgoing.status);
@@ -690,17 +1272,117 @@ Task<void> Connection::write_response(const Response& response,
     head.append(serialize_headers(outgoing.headers));
     head.append("\r\n");
 
-    co_await _stream.send_all(std::string_view(head));
+    co_await with_optional_timeout(_stream.send_all(std::string_view(head)),
+                                   _timeouts.write, 504, "response write timeout");
 
     if (!response_has_body(outgoing.status, request_method)) {
         co_return;
     }
 
-    if (outgoing.chunked) {
-        co_await write_chunked_body(_stream, outgoing.body);
-    } else if (!outgoing.body.empty()) {
-        co_await _stream.send_all(std::string_view(outgoing.body));
+    if (!outgoing.body.empty()) {
+        co_await with_optional_timeout(_stream.send_all(std::string_view(outgoing.body)),
+                                       _timeouts.write, 504,
+                                       "response write timeout");
     }
+}
+
+Task<void> Connection::write_request_stream(const Request& request,
+                                            BodyChunkSource body_source,
+                                            std::string_view default_host) {
+    Request outgoing = request;
+    if (outgoing.target.empty()) {
+        outgoing.target = "/";
+    }
+    if (outgoing.version_minor < 0 || outgoing.version_minor > 1) {
+        throw std::logic_error("corouv::http::Connection only supports HTTP/1.x");
+    }
+
+    if (!default_host.empty() && !find_header(outgoing.headers, "Host")) {
+        set_header(outgoing.headers, "Host", std::string(default_host));
+    }
+
+    outgoing.chunked = true;
+    outgoing.body.clear();
+    prepare_outgoing_headers(outgoing.headers, outgoing.keep_alive,
+                             outgoing.chunked, 0);
+    const bool expect_100 = expects_continue(outgoing.headers);
+
+    std::string head;
+    head.reserve(128);
+    head.append(outgoing.method);
+    head.push_back(' ');
+    head.append(outgoing.target);
+    head.append(" HTTP/1.");
+    head.append(std::to_string(outgoing.version_minor));
+    head.append("\r\n");
+    head.append(serialize_headers(outgoing.headers));
+    head.append("\r\n");
+
+    co_await with_optional_timeout(_stream.send_all(std::string_view(head)),
+                                   _timeouts.write, 504, "request write timeout");
+    if (expect_100) {
+        std::string prefetched_body;
+        const BodySink sink =
+            [&prefetched_body](std::string_view chunk) -> Task<void> {
+            prefetched_body.append(chunk);
+            co_return;
+        };
+
+        auto prefetched =
+            co_await read_response_stream_impl(outgoing.method, sink, false);
+        prefetched.body = std::move(prefetched_body);
+        if (prefetched.status != 100) {
+            _prefetched_response = std::move(prefetched);
+            co_return;
+        }
+    }
+
+    co_await write_chunked_body_stream(_stream, std::move(body_source),
+                                       outgoing.trailers,
+                                       _timeouts.write, 504,
+                                       "request write timeout");
+}
+
+Task<void> Connection::write_response_stream(const Response& response,
+                                             BodyChunkSource body_source,
+                                             std::string_view request_method) {
+    Response outgoing = response;
+    if (outgoing.reason.empty()) {
+        outgoing.reason = reason_phrase(outgoing.status);
+    }
+    if (outgoing.version_minor < 0 || outgoing.version_minor > 1) {
+        throw std::logic_error("corouv::http::Connection only supports HTTP/1.x");
+    }
+
+    const bool has_body = response_has_body(outgoing.status, request_method);
+    outgoing.chunked = has_body;
+    outgoing.body.clear();
+    prepare_outgoing_headers(outgoing.headers, outgoing.keep_alive,
+                             outgoing.chunked, 0);
+
+    std::string head;
+    head.reserve(128);
+    head.append("HTTP/1.");
+    head.append(std::to_string(outgoing.version_minor));
+    head.push_back(' ');
+    head.append(std::to_string(outgoing.status));
+    head.push_back(' ');
+    head.append(outgoing.reason);
+    head.append("\r\n");
+    head.append(serialize_headers(outgoing.headers));
+    head.append("\r\n");
+
+    co_await with_optional_timeout(_stream.send_all(std::string_view(head)),
+                                   _timeouts.write, 504, "response write timeout");
+
+    if (!has_body) {
+        co_return;
+    }
+
+    co_await write_chunked_body_stream(_stream, std::move(body_source),
+                                       outgoing.trailers,
+                                       _timeouts.write, 504,
+                                       "response write timeout");
 }
 
 Server::Server(UvExecutor& ex, Handler handler, ServerOptions options)
@@ -717,7 +1399,7 @@ Task<void> Server::listen() {
 }
 
 Task<void> Server::handle_client(io::ByteStream stream) {
-    Connection conn(std::move(stream), _options.limits);
+    Connection conn(std::move(stream), _options.limits, _options.timeouts);
 
     while (conn.is_open()) {
         Request request;
@@ -868,8 +1550,8 @@ Task<void> Client::connect(std::string host, std::uint16_t port) {
     auto stream = co_await net::connect(*_ex, host, port);
     _host = std::move(host);
     _port = port;
-    _connection =
-        std::make_unique<Connection>(std::move(stream), _options.limits);
+    _connection = std::make_unique<Connection>(std::move(stream), _options.limits,
+                                               _options.timeouts);
     co_return;
 }
 
